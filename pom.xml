@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.ld.cloud</groupId>
+    <artifactId>springCloud-demo</artifactId>
+    <packaging>pom</packaging>
+    <version>1.0.0-SNAPSHOT</version>
+
+    <name>${project.artifactId}</name>
+    <description>springCloud demo</description>
+
+    <licenses>
+        <license>
+            <name>GNU General Public License version 3</name>
+            <url>https://opensource.org/licenses/GPL-3.0</url>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>springCloud demo</id>
+            <name>Dong li</name>
+            <email>superhero_l@163.com</email>
+            <url>https://github.com/superHeroLD/SpringCloud-Demo</url>
+        </developer>
+    </developers>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>2.4.1</version>
+    </parent>
+
+    <!-- 版本控制 -->
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <gson.version>2.8.6</gson.version>
+        <spring.version>5.2.8.RELEASE</spring.version>
+        <spring.boot.version>2.3.3.RELEASE</spring.boot.version>
+        <java.version>1.8</java.version>
+        <logback.version>1.2.3</logback.version>
+        <mybatis.version>3.5.5</mybatis.version>
+        <mysql.connector.version>8.0.21</mysql.connector.version>
+        <mybatis.spring.boot.starter.version>2.1.3</mybatis.spring.boot.starter.version>
+        <mybatis.plus.boot.starter.version>3.4.0</mybatis.plus.boot.starter.version>
+        <hutool.version>5.4.6</hutool.version>
+        <disruptor.version>3.4.2</disruptor.version>
+        <lombok.version>1.18.12</lombok.version>
+        <slf4j-api.version>1.7.30</slf4j-api.version>
+        <quartz.version>2.3.2</quartz.version>
+        <netty.version>4.1.52.Final</netty.version>
+        <hessian.version>4.0.63</hessian.version>
+
+        <plugin.compiler.version>3.8.0</plugin.compiler.version>
+        <plugin.source.version>3.0.1</plugin.source.version>
+        <plugin.surefire.version>2.22.1</plugin.surefire.version>
+        <plugin.versions.version>2.7</plugin.versions.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>fastjson</artifactId>
+            <version>1.2.74</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+        </plugins>
+    </build>
+</project>
