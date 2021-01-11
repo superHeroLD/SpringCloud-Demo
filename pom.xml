@@ -4,13 +4,12 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.ld.cloud</groupId>
+    <groupId>cn.ld.cloud</groupId>
     <artifactId>springCloud-demo</artifactId>
     <packaging>pom</packaging>
     <version>1.0.0-SNAPSHOT</version>
 
-    <name>${project.artifactId}</name>
-    <description>springCloud demo</description>
+    <description>SpringCloud demo</description>
 
     <licenses>
         <license>
@@ -18,6 +17,9 @@
             <url>https://opensource.org/licenses/GPL-3.0</url>
         </license>
     </licenses>
+    <modules>
+        <module>DiscoveryDemo</module>
+    </modules>
 
     <developers>
         <developer>
@@ -36,13 +38,12 @@
 
     <!-- 版本控制 -->
     <properties>
+        <java.version>1.8</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <maven.compiler.source>${java.version}</maven.compiler.source>
+        <maven.compiler.target>${java.version}</maven.compiler.target>
 
-        <gson.version>2.8.6</gson.version>
-        <spring.version>5.2.8.RELEASE</spring.version>
-        <spring.boot.version>2.3.3.RELEASE</spring.boot.version>
-        <java.version>1.8</java.version>
         <logback.version>1.2.3</logback.version>
         <mybatis.version>3.5.5</mybatis.version>
         <mysql.connector.version>8.0.21</mysql.connector.version>
@@ -55,14 +56,30 @@
         <quartz.version>2.3.2</quartz.version>
         <netty.version>4.1.52.Final</netty.version>
         <hessian.version>4.0.63</hessian.version>
-
-        <plugin.compiler.version>3.8.0</plugin.compiler.version>
-        <plugin.source.version>3.0.1</plugin.source.version>
-        <plugin.surefire.version>2.22.1</plugin.surefire.version>
-        <plugin.versions.version>2.7</plugin.versions.version>
+        <fastjson.version>1.2.75</fastjson.version>
+        <gson.vsersion>2.8.6</gson.vsersion>
     </properties>
 
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>2020.0.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
+        <!-- spring -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -73,7 +90,7 @@
         <dependency>
             <groupId>com.alibaba</groupId>
             <artifactId>fastjson</artifactId>
-            <version>1.2.74</version>
+            <version>${fastjson.version}</version>
         </dependency>
     </dependencies>
 
