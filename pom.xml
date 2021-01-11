@@ -19,6 +19,8 @@
     </licenses>
     <modules>
         <module>DiscoveryDemo</module>
+        <module>ServiceDemo</module>
+        <module>AnotherServiceDemo</module>
     </modules>
 
     <developers>
