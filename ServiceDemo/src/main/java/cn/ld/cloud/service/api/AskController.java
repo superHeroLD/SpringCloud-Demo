@@ -1,5 +1,6 @@
 package cn.ld.cloud.service.api;
 
+import cn.ld.cloud.service.service.RandomService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -19,9 +20,11 @@ public class AskController {
 
     @Resource
     private RestTemplate restTemplate;
+    @Resource
+    private RandomService randomService;
 
     @GetMapping("/askRandomNum")
     public int askRandomNum() {
-        return restTemplate.getForEntity("http://SERVICE-PROVIDER/random/getRandomNum", Integer.class).getBody();
+        return randomService.getRandomNum();
     }
 }
