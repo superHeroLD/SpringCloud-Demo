@@ -28,7 +28,8 @@ EurekaBootStrap的主要功能就是负责启动、初始化、并配置Eurka。
 > 这里注意一下ConfigurationManager初始化使用了Double check形式的单例模式（TODO 后面把代码贴上来），一般我看开源项目中，使用内部类单例的比较少，大部分都使用了DoubleCheck形式的单例模式，DoubleCheck的单例模式需要重点注意一点就是使用volatile关键字修饰单例对象，不然在多线程的情况下，有可能初始化多次。  
 >
 **initEurekaEnvironment中ConfigurationManager初始化流程**  
-  1.创建一个ConcurrentCompositeConfiguration实例，这个类就包括了eureka所需的所有配置。初始化的时候调用了clear()方法，该方法的作用就是清理了一下配置Map和Eureka相关的事件的监听器List（map和list都是用的线程安全的类，具体哪个自己想），随后调用了fireEvent()方法发布了一个事件(EVENT_CLEAR).fireEvent()方法是netfilx另一个项目netfiex-config中的源码方法，有时间在研究一下那个项目。
-  2.随后就往ConcurrentCompositeConfiguration中又加入了一些别的config，随后返回了这个实例。
-  3.初始化数据数据中心的配置，如果没有的话，就使用默认配置Default data center（这里的数据中心是干嘛的？）
-  4.初始化eureka的运行环境，如果没有配置指定，那么就设置为test环境（有什么影响吗？）
+  1.创建一个ConcurrentCompositeConfiguration实例，这个类就包括了eureka所需的所有配置。初始化的时候调用了clear()方法，该方法的作用就是清理了一下配置Map和Eureka相关的事件的监听器List（map和list都是用的线程安全的类，具体哪个自己想），随后调用了fireEvent()方法发布了一个事件(EVENT_CLEAR).fireEvent()方法是netfilx另一个项目netfiex-config中的源码方法，有时间在研究一下那个项目。  
+  2.随后就往ConcurrentCompositeConfiguration中又加入了一些别的config，随后返回了这个实例  
+  3.初始化数据数据中心的配置，如果没有的话，就使用默认配置Default data center（这里的数据中心是干嘛的？）  
+  4.初始化eureka的运行环境，如果没有配置指定，那么就设置为test环境（有什么影响吗？）  
+ 
