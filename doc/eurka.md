@@ -32,4 +32,6 @@ EurekaBootStrap的主要功能就是负责启动、初始化、并配置Eurka。
   2.随后就往ConcurrentCompositeConfiguration中又加入了一些别的config，随后返回了这个实例  
   3.初始化数据数据中心的配置，如果没有的话，就使用默认配置Default data center（这里的数据中心是干嘛的？）  
   4.初始化eureka的运行环境，如果没有配置指定，那么就设置为test环境（有什么影响吗？）  
- 
+
+在家eureka-server.properties中的配置
+在eureka-server的resources下面有个eureka-server.properties配置（但是源码中这个文件中的配置都是被注释掉的），这里的配置会加载到DefaultEurekaServerConfig中，这个类是EurekaServerConfig的实现类。
