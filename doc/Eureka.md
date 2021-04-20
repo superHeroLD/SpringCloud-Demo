@@ -117,4 +117,3 @@ DiscoveryClient是EurekaClient的具体实现类，用于与eureka-server进行�
 - 从 Eureka-Server **查询**应用集合和应用实例信息
 
 > *简单理解，就是实现了对 Eureka-Server 服务的增删改查操作*
-
