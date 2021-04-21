@@ -20,15 +20,15 @@
 
 从eurka-server的web.xml开始入手，首先是一个Listener **EurekaBootStrap**：负责eurka-server的初始化
 
-#### 四个filter
+#### Filter们
 
-\+ StatusFilter：
+包com.netflix.eureka
 
-\+ ServerRequestAuthFilter：
-
-\+ RateLimitingFilter：限流
-
-\+ GzipEncodingEnforcingFilter：报文压缩
+- StatusFilter：状态过滤器
+- ServerRequestAuthFilter：Eureka-Server 请求认证过滤器
+- RateLimitingFilterL：实现限流
+- GzipEncodingEnforcingFilter：GZIO编码过滤
+- ServletContainer：Jersey MVC请求过滤器
 
 通过<filter-mapping>可知StatusFilter和ServerRequestAuthFilter是对所有请求都开放的。RateLimitingFilter，默认是不开启的，如果需要打开eurka-server内置的限流功能，需要自己吧RateLimitingFilter的<filter-mapping>注释打开。GzipEncodingEnforcingFilter拦截/v2/apps相关的请求。Jersery的核心filter是默认拦截所有请求的。
 
@@ -38,13 +38,21 @@
 
 EurekaBootStrap的主要功能就是负责启动、初始化、并配置Eurka。在EurekaBootStrap中监听器执行初始化的方法，是contextInitialized()方法，这个方法就是整个eureka-server启动初始化的一个入口。initEurekaServerContext()方法负责初始化eureka-server的上下文。
 
-#### 初始化Eureka相关配置
+#### 初始化Eureka-server上下文
+
+EurekaServerConfig其实是基于配置文件实现的Eureka-server的配置类，提供了如下相关的配置：
+
+- 请求认证相关
+- 请求限流相关
+- 获取注册信息请求相关
+- 自我保护机制相关（划重点）
+- 注册的应用实例的租约过期相关
 
 initEurekaServerContext()方法中，EurekaServerConfig eurekaServerConfig = new DefaultEurekaServerConfig()这一行代码会进行初始化eureka-server的相关配置。initEurekaEnvironment()方法负责初始化eureka-server的环境。在里面会调用ConfigurationManager.getConfigInstance()方法，这个方法的作用就是在初始化ConfigurationManager的实例，ConfigurationManager从字面上就能看出来是一个配置管理器，负责将配置文件中的配置加载进来供后面的Eurka初始化使用（后面会说到，没有配置的话会自动使用默认配置）。
 
 >  这里注意一下ConfigurationManager初始化使用了Double check形式的单例模式（TODO 后面把代码贴上来），一般我看开源项目中，使用内部类单例的比较少，大部分都使用了DoubleCheck形式的单例模式，DoubleCheck的单例模式需要重点注意一点就是使用volatile关键字修饰单例对象，不然在多线程的情况下，有可能初始化多次。
 >
-> ![14097005894197ee0f7e2b3a9fed7730.png](evernotecid://62E7E6AC-1793-4D73-AE1C-84E43655EB8F/appyinxiangcom/18219242/ENResource/p870)
+>  ![14097005894197ee0f7e2b3a9fed7730.png](evernotecid://62E7E6AC-1793-4D73-AE1C-84E43655EB8F/appyinxiangcom/18219242/ENResource/p870)
 
 **initEurekaEnvironment中ConfigurationManager初始化流程**
 
@@ -117,3 +125,92 @@ DiscoveryClient是EurekaClient的具体实现类，用于与eureka-server进行�
 - 从 Eureka-Server **查询**应用集合和应用实例信息
 
 > *简单理解，就是实现了对 Eureka-Server 服务的增删改查操作*
+
+DiscoveryClient的完整构造方法如下
+
+```java
+DiscoveryClient(ApplicationInfoManager applicationInfoManager, EurekaClientConfig config, AbstractDiscoveryClientOptionalArgs args,
+                Provider<BackupRegistry> backupRegistryProvider, EndpointRandomizer endpointRandomizer) 
+```
+
+- 其中backupRegistryProvider，`com.netflix.discovery.BackupRegistry`，备份注册中心接口。当 Eureka-Client 启动时，无法从 Eureka-Server 读取注册信息（可能挂了），从备份注册中心读取注册信息。默认实现是`com.netflix.discovery.NotImplementedRegistryImpl` 可以看出，目前 Eureka-Client 未提供合适的默认实现。
+
+- `com.netflix.discovery.AbstractDiscoveryClientOptionalArgs`，DiscoveryClient 可选参数抽象基类。不同于上面三个必填参数，该参数是选填参数，实际生产下使用较少。这里有一个HealthCheckCallback的健康检查回调接口，目前已经废弃，使用 HealthCheckHandler 替可以不再关注。HealthCheckHandler健康检查处理器接口，目前暂未提供合适的默认实现，唯一提供的 `com.netflix.appinfo.HealthCheckCallbackToHandlerBridge`，用于将 HealthCheckCallback 桥接成 HealthCheckHandler。（这里可以学习一下桥接模式的使用）在 Spring-Cloud-Eureka-Client，提供了默认实现 [`org.springframework.cloud.netflix.eureka.EurekaHealthCheckHandler`](https://github.com/spring-cloud/spring-cloud-netflix/blob/82991a7fc2859b6345b7f67e2461dbf5d7663836/spring-cloud-netflix-eureka-client/src/main/java/org/springframework/cloud/netflix/eureka/EurekaHealthCheckHandler.java)，需要结合 [`spirng-boot-actuate`](https://github.com/spring-projects/spring-boot/tree/c79568886406662736dcdce78f65e7f46dd62696/spring-boot-actuator/) 使用
+- 这里有一个拓展点`com.netflix.discovery.PreRegistrationHandler`，向 Eureka-Server 注册之前的处理器接口，目前暂未提供默认实现。通过实现该接口，可以在注册前做一些自定义的处理。
+
+DiscoveryClient构造步骤
+
+1. 赋值AbstractDiscoveryClientOptionalArgs
+2. 赋值ApplicationInfoManager、EurekaClientConfig
+3. 初始化Applications在本地的缓存
+4. 获取那些Region集合的注册信息
+5. 初始化拉取、心跳的监控，这里有两个时间戳在每次从eureka-server拉取心跳或者拉取注册信息后都会更新
+6. 如果配置了shouldRegisterWithEureka或者shouldFetchRegistry参数，那么这里都会和eureka-server进行交互
+7. 初始化3个线程池，分别是scheduler负责执行（updating service urls、scheduling a TimedSuperVisorTask）、heartbeatExecutor（心跳执行器）、cacheRefreshExecutor（刷新执行器）
+8. 初始化网络通信相关eurekaTransport = new EurekaTransport();
+9. 从Eureka-Server 拉取注册信息，调用fetchRegistry方法拉取注册信息，如果失败了则走fetchRegistryFromBackup方法从备份注册中心拉取，但是BackupRegistry目前没有默认实现，所以这里是个扩展点，需要用户自己实现。
+10. 执行前面说的PreRegistrationHandler注册前的处理器（拓展点）
+11. 初始化定时任务
+12. 向Netflix Servo注册监控
+
+**PeerAwareInstanceRegistry应用实例注册表（应该是）**
+
+分为亚马逊环境和非亚马逊环境两套逻辑
+
+**创建Eureka-server集群节点集合**
+
+```java
+PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(
+        registry,
+        eurekaServerConfig,
+        eurekaClient.getEurekaClientConfig(),
+        serverCodecs,
+        applicationInfoManager
+);
+```
+
+**创建Eureka-server上下文**
+
+```java
+serverContext = new DefaultEurekaServerContext(
+        eurekaServerConfig,
+        serverCodecs,
+        registry,
+        peerEurekaNodes,
+        applicationInfoManager
+);
+```
+
+com.netflix.eureka.EurekaServerContext是上下文接口，提供了Eureka-Server内部各个组件对象的初始化、关闭、获取等方法
+
+**初始化EurekaServerContextHolder和上下文**
+
+```java
+EurekaServerContextHolder.initialize(serverContext);
+serverContext.initialize();
+```
+
+通过EurekaServerContextHolder可以很方便的提取Eureka-Server的上下文信息
+
+**从其他Eureka-Server拉取注册信息**
+
+```java
+// Copy registry from neighboring eureka node
+int registryCount = registry.syncUp();
+registry.openForTraffic(applicationInfoManager, registryCount);
+```
+
+简单的说就是进行集群同步（这里要好好看看）
+
+**注册监控**
+
+```java
+EurekaMonitors.registerAllStats();
+```
+
+注册Netflix Servo实现监控信息采集
+
+#### 总结
+
+通过ServletContextListener启动了EurekaBootStrap，在EurekaBootStrap中用过读取配置文件、Aws等初始化Eureka-Server的上下文，同时初始化了一个内嵌的Eureka-Client与集群中的其他Eureka-Server交互，最后进行了集群信息同步。
+
