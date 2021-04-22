@@ -214,3 +214,62 @@ EurekaMonitors.registerAllStats();
 
 通过ServletContextListener启动了EurekaBootStrap，在EurekaBootStrap中用过读取配置文件、Aws等初始化Eureka-Server的上下文，同时初始化了一个内嵌的Eureka-Client与集群中的其他Eureka-Server交互，最后进行了集群信息同步。
 
+#### Eureka-Client发起服务注册
+
+Eureka-Client 向 Eureka-Server 发起注册应用实例需要符合如下条件：
+
+- 配置 `eureka.registration.enabled = true`，Eureka-Client 向 Eureka-Server 发起注册应用实例的开关。
+- InstanceInfo 在 Eureka-Client 和 Eureka-Server 数据不一致。
+
+每次 InstanceInfo 发生属性变化时，标记 `isInstanceInfoDirty` 属性为 `true`，表示 InstanceInfo 在 Eureka-Client 和 Eureka-Server 数据不一致，需要注册。另外，InstanceInfo 刚被创建时，在 Eureka-Server 不存在，也会被注册。当符合条件时，InstanceInfo 不会立即向 Eureka-Server 注册，而是后台线程定时注册。
+
+当 InstanceInfo 的状态( `status` ) 属性发生变化时，并且配置 `eureka.shouldOnDemandUpdateStatusChange = true` 时，立即向 Eureka-Server 注册。因为状态属性非常重要，一般情况下建议开启，当然默认情况也是开启的。
+
+在DiscoveryClient中有一个应用实例注册器InstanceInfoReplicator类负责将应用信息复制到Eureka-Server上，调用start()方法负责应用实例注册。InstanceInfoReplicator会把自己作为一个定时线程任务，定时的去检查InstanceInfo的状态是否发生了变化，具体流程如下：
+
+- 调用 `DiscoveryClient#refreshInstanceInfo()` 方法，刷新应用实例信息。此处可能导致应用实例信息数据不一致。
+- 调用 `DiscoveryClient#register()` 方法，Eureka-Client 向 Eureka-Server 注册应用实例。
+- 调用 `ScheduledExecutorService#schedule(...)` 方法，再次延迟执行任务，并设置 `scheduledPeriodicRef`。通过这样的方式，不断循环定时执行任务。（注意看这里的代码实现也可以借鉴一下，形成一个时间轮）
+
+```java
+   try {
+       // 刷新 应用实例信息
+       discoveryClient.refreshInstanceInfo();
+       // 判断 应用实例信息 是否数据不一致
+       Long dirtyTimestamp = instanceInfo.isDirtyWithTime();
+       if (dirtyTimestamp != null) {
+           // 发起注册
+           discoveryClient.register();
+           // 设置 应用实例信息 数据一致
+           instanceInfo.unsetIsDirty(dirtyTimestamp);
+       }
+   } catch (Throwable t) {
+       logger.warn("There was a problem with the instance info replicator", t);
+   } finally {
+       // 提交任务，并设置该任务的 Future 注意这里实际上形成了一个时间轮，以后有类似的需求可以通过这种方法实现时间轮
+       Future next = scheduler.schedule(this, replicationIntervalSeconds, TimeUnit.SECONDS);
+       scheduledPeriodicRef.set(next);
+   }
+```
+
+InstanceInfo的status改变发生在调用 `ApplicationInfoManager#setInstanceStatus(...)` 方法，设置应用实例信息的状态，从而通知 `InstanceInfoReplicator#onDemandUpdate()` 方法的调用,在这份方法中最终会调用InstanceInfoReplicator类的InstanceInfoReplicator.this.run();
+
+> Eureka这里有个Pair类，有点意思。可以学习一下这种不固定的多类型参数传递可以自己实现一个类似的类。
+
+##### 刷新应用实例
+
+通过调用 `DiscoveryClient#refreshInstanceInfo()`刷新应用实例，最终都会调用到ApplicationInfoManager中的方法。然后就会刷新一些属性等等等等等。
+
+##### 发起实例注册
+
+调用 `DiscoveryClient#register()` 方法，Eureka-Client 向 Eureka-Server 注册应用实例。最终调用调用 `AbstractJerseyEurekaHttpClient#register(...)` 方法，POST 请求 Eureka-Server 的 apps/${APP_NAME} 接口，参数为 InstanceInfo ，实现注册实例信息的注册。
+
+##### Eureka-server接收注册
+
+在eureka-core项目中，有个resource包，里面全是一些XXXResource类，这些类其实类似于Spring中的Controller，就是Jersey实现的MVC。其中ApplicationResource是处理单个应用注册的Resource。注册应用实例信息的请求，映射 `ApplicationResource#addInstance()` 方法。注册的相关代码很长，涉及到了`PeerAwareInstanceRegistryImpl#register()`、最终的注册逻辑在`AbstractInstanceRegistry#register()`方法中实现。逻辑比较多，简单的概括一下都做了什么事情。
+
+- 用读写锁控制注册，提供了并发性能。
+- 增加了监控
+- 添加到最近注册的调试队列( `recentRegisteredQueue` )这个是干嘛的？
+- 修改了一些租约信息什么的
+- **最终把实例信息放入了Map<String, Lease<InstanceInfo>>  gMap中**
