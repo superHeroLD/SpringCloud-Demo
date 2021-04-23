@@ -225,7 +225,7 @@ Eureka-Client 向 Eureka-Server 发起注册应用实例需要符合如下条件
 
 当 InstanceInfo 的状态( `status` ) 属性发生变化时，并且配置 `eureka.shouldOnDemandUpdateStatusChange = true` 时，立即向 Eureka-Server 注册。因为状态属性非常重要，一般情况下建议开启，当然默认情况也是开启的。
 
-在DiscoveryClient中有一个应用实例注册器InstanceInfoReplicator类负责将应用信息复制到Eureka-Server上，调用start()方法负责应用实例注册。InstanceInfoReplicator会把自己作为一个定时线程任务，定时的去检查InstanceInfo的状态是否发生了变化，具体流程如下：
+在DiscoveryClien构造函数中的`initScheduledTask()`方法种有一个应用实例注册器InstanceInfoReplicator类负责将应用信息复制到Eureka-Server上，调用start()方法负责应用实例注册。InstanceInfoReplicator会把自己作为一个定时线程任务，定时的去检查InstanceInfo的状态是否发生了变化，具体流程如下：
 
 - 调用 `DiscoveryClient#refreshInstanceInfo()` 方法，刷新应用实例信息。此处可能导致应用实例信息数据不一致。
 - 调用 `DiscoveryClient#register()` 方法，Eureka-Client 向 Eureka-Server 注册应用实例。
@@ -273,3 +273,34 @@ InstanceInfo的status改变发生在调用 `ApplicationInfoManager#setInstanceSt
 - 添加到最近注册的调试队列( `recentRegisteredQueue` )这个是干嘛的？
 - 修改了一些租约信息什么的
 - **最终把实例信息放入了Map<String, Lease<InstanceInfo>>  gMap中**
+- 还有很重要的一点就是`invalidateCache()`方法清除本地缓存readWriteCacheMap
+
+#### Eureka-Client发起服务续约
+
+Eureka-Client 向 Eureka-Server 发起注册应用实例成功后获得租约 ( Lease )。Eureka-Client **固定间隔**向 Eureka-Server 发起续租( renew )，避免租约过期。
+
+默认情况下，租约有效期为 90 秒，续租频率为 30 秒。两者比例为 1 : 3 ，保证在网络异常等情况下，有三次重试的机会。
+
+Eureka-Client通过心跳任务`HeartbeatThread()`续约。
+
+```java
+private class HeartbeatThread implements Runnable {
+   public void run() {
+       if (renew()) {
+           lastSuccessfulHeartbeatTimestamp = System.currentTimeMillis();
+       }
+   }
+}
+```
+
+在`renew()`方法中最终通过发送PUT请求 Eureka-Server 的 `apps/${APP_NAME}/${INSTANCE_INFO_ID}` 接口，参数为 `status`、`lastDirtyTimestamp`、`overriddenstatus`，实现续租。
+
+##### TimedSupervisorTask
+
+`com.netflix.discovery.TimedSupervisorTask`，监管定时任务的任务。
+
+##### Eureka-Server接收续租
+
+`InstanceResource`，处理**单个**应用实例信息的请求操作的 Resource 。续租应用实例信息的请求，映射 `renewLease()` 方法。续租方法的核心逻辑如下：
+
+各种判断续租是否成功，如果成功了会将应用续租信息进行集群同步，最终续租信息也会展示在Eureka的管理端页面上。
