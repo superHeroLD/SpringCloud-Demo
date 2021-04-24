@@ -304,3 +304,215 @@ private class HeartbeatThread implements Runnable {
 `InstanceResource`，处理**单个**应用实例信息的请求操作的 Resource 。续租应用实例信息的请求，映射 `renewLease()` 方法。续租方法的核心逻辑如下：
 
 各种判断续租是否成功，如果成功了会将应用续租信息进行集群同步，最终续租信息也会展示在Eureka的管理端页面上。
+
+#### Eureka-Client获取注册信息
+
+**Applications**封装由Eureka服务器返回的所有注册表信息的类，在获取后会进行混洗，然后根据`InstanceStatus＃UP`状态进行过滤。
+
+**Application**类包含了特定实例的应用信息(**InstanceInfo**)列表。
+
+**InstanceInfo**类包含了一个服务实例被其他服务发现所需要的必须信息。
+
+Applications 与 InstanceInfo 类关系如下：**Applications** 1:N **Application** 1:N **InstanceInfo**
+
+> 后面所说的Eureka-Client拉取的注册信息都是Applications
+
+##### Eureka-Client初始化时全量获取注册信息
+
+Eureka-Client 获取注册信息，分成全量获取和增量获取。默认配置下，Eureka-Client 启动时，首先执行一次全量获取进行本地缓存注册信息，而后每 **30** 秒增量获取刷新本地缓存( 非正常情况下会是全量获取，对比注册信息哈希值不一致)，Eureka-Client在启动时会执行下面这段代码，根据`shouldFetchRegistry == true`配置判断是否拉取注册信息，通过fetchRegistry(false)方法获取全量注册信息。
+
+```java
+if (clientConfig.shouldFetchRegistry()) {
+    try {
+        boolean primaryFetchRegistryResult = fetchRegistry(false);
+        if (!primaryFetchRegistryResult) {
+            logger.info("Initial registry fetch from primary servers failed");
+        }
+        boolean backupFetchRegistryResult = true;
+        if (!primaryFetchRegistryResult && !fetchRegistryFromBackup()) {
+            backupFetchRegistryResult = false;
+            logger.info("Initial registry fetch from backup servers failed");
+        }
+        if (!primaryFetchRegistryResult && !backupFetchRegistryResult && clientConfig.shouldEnforceFetchRegistryAtInit()) {
+            throw new IllegalStateException("Fetch registry error at startup. Initial fetch failed.");
+        }
+    } catch (Throwable th) {
+        logger.error("Fetch registry error at startup: {}", th.getMessage());
+        throw new IllegalStateException(th);
+    }
+}
+```
+
+这个方法最终会通过jerseyClient使用Get请求到`ApplicationsResource#getContainers()`获取Applications信息。
+
+**定时获取**
+
+Eureka-Client 在初始化过程中，创建获取注册信息线程，固定间隔30S向 Eureka-Server 发起获取注册信息( fetch )，刷新本地注册信息缓存。具体实现在`initScheduledTasks()`方法中创建了`CacheRefreshThread()`任务，`client.refresh.interval`配置为具体的执行时间间隔，默认为30S
+
+```java
+if (clientConfig.shouldFetchRegistry()) {
+    // registry cache refresh timer
+    int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();
+    int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();
+    cacheRefreshTask = new TimedSupervisorTask(
+            "cacheRefresh",
+            scheduler,
+            cacheRefreshExecutor,
+            registryFetchIntervalSeconds,
+            TimeUnit.SECONDS,
+            expBackOffBound,
+            new CacheRefreshThread()
+    );
+    scheduler.schedule(
+            cacheRefreshTask,
+            registryFetchIntervalSeconds, TimeUnit.SECONDS);
+}
+```
+
+在`CacheRefreshThread()`中调用`fetchRegistry（）`方法获取注册信息。获取注册信息后回更新注册信息的应用实例数，最后回去注册信息的时间。
+
+**fetchRegistry()方法**
+
+调用 `#fetchRegistry(false)` 方法，从 Eureka-Server 获取注册信息( 根据条件判断，可能是**全量**，也可能是**增量** )。fetchRegistry()方法中的逻辑我觉得比较重要，所有没有节省篇幅把代码都贴上来了。
+
+```java
+private boolean fetchRegistry(boolean forceFullRegistryFetch) {
+    Stopwatch tracer = FETCH_REGISTRY_TIMER.start();
+
+    try {
+        // If the delta is disabled or if it is the first time, get all
+        // applications
+        Applications applications = getApplications();
+
+        if (clientConfig.shouldDisableDelta()
+                || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))
+                || forceFullRegistryFetch
+                || (applications == null)
+                || (applications.getRegisteredApplications().size() == 0)
+                || (applications.getVersion() == -1)) //Client application does not have latest library supporting delta
+        {
+            logger.info("Disable delta property : {}", clientConfig.shouldDisableDelta());
+            logger.info("Single vip registry refresh property : {}", clientConfig.getRegistryRefreshSingleVipAddress());
+            logger.info("Force full registry fetch : {}", forceFullRegistryFetch);
+            logger.info("Application is null : {}", (applications == null));
+            logger.info("Registered Applications size is zero : {}",
+                    (applications.getRegisteredApplications().size() == 0));
+            logger.info("Application version is -1: {}", (applications.getVersion() == -1));
+            getAndStoreFullRegistry();
+        } else {
+            getAndUpdateDelta(applications);
+        }
+        applications.setAppsHashCode(applications.getReconcileHashCode());
+        logTotalInstances();
+    } catch (Throwable e) {
+        logger.info(PREFIX + "{} - was unable to refresh its cache! This periodic background refresh will be retried in {} seconds. status = {} stacktrace = {}",
+                appPathIdentifier, clientConfig.getRegistryFetchIntervalSeconds(), e.getMessage(), ExceptionUtils.getStackTrace(e));
+        return false;
+    } finally {
+        if (tracer != null) {
+            tracer.stop();
+        }
+    }
+    // Notify about cache refresh before updating the instance remote status
+    onCacheRefreshed();
+    // Update remote status based on refreshed data held in the cache
+    updateInstanceRemoteStatus();
+    // registry was fetched successfully, so return true
+    return true;
+}
+```
+
+具体逻辑如下：
+
+- 从本地缓存AtomicReference<Applications> localRegionApps中获取Applications
+
+- 根据条件判断是全量获取还增量获取，**通过getAndStoreFullRegistry()获取全量注册信息并设置到本地缓存AtomicReference<Applications> localRegionApps**（这里只看全量获取的逻辑）
+
+- `setAppsHashCode()`方法计算应用集合的hashcode
+
+- `onCacheRefreshed()`触发 CacheRefreshedEvent 事件，事件监听器执行。目前 Eureka 未提供默认的该事件监听器。可以实现自定义的事件监听器监听 CacheRefreshedEvent 事件，以达到**持久化**最新的注册信息到存储器( 例如，本地文件 )，通过这样的方式，配合实现 BackupRegistry 接口读取存储器。BackupRegistry 接口调用如下:
+
+  ```java
+  if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {
+      fetchRegistryFromBackup();
+  }
+  ```
+
+- `updateInstanceRemoteStatus()`更新本地缓存的当前应用实例在Eureka-Server的状态，对比**本地缓存**和**最新的**的当前应用实例在 Eureka-Server 的状态，若不同，更新**本地缓存**( **注意，只更新该缓存变量，不更新本地当前应用实例的状态( `instanceInfo.status` )** )，触发 StatusChangeEvent 事件，事件监听器执行。目前 Eureka 未提供默认的该事件监听器。
+
+#### Eureka-Server处理全量获取请求
+
+`ApplicationsResource类`是处理**所有**应用的请求操作的 Resource，接收全量获取请求映射到 `ApplicationsResource#getContainers()` 方法.在getContainers方法中，最终会从ResponseCache中获取注册信息，根据`shouldUseReadOnlyResponseCache == true`判断是否只从readOnlyCacheMap中获取注册信息，否则就从readWriteCacheMap中获取全量注册信息。
+
+#### Eureka缓存结构
+
+Eureka作为注册中心采用了AP模式，所以可以使用缓存。
+
+Eureka中的缓存结构，`ResponseCache`，响应缓存**接口**，其实现类`com.netflix.eureka.registry.ResponseCacheImpl`，响应缓存实现类。在 ResponseCacheImpl 里，将缓存拆分成两层 ：
+
+- **只读缓存**( `readOnlyCacheMap` )
+- **固定过期** + **固定大小**的**读写缓存**( `readWriteCacheMap` )，最大缓存数量为1000，通过Guava Cache实现的。
+
+默认配置下，**缓存读取策略**如下：
+
+![image-20210424153953413](/Users/lidong/Library/Application Support/typora-user-images/image-20210424153953413.png)
+
+**缓存过期策略**如下：
+
+- 应用实例注册、下线、过期时，**只**过期 `readWriteCacheMap` 。
+- `readWriteCacheMap` 写入一段时间( 可配置 )后自动过期。
+- 定时任务对比 `readWriteCacheMap` 和 `readOnlyCacheMap` 的缓存值，若不一致，以前者为主。通过这样的方式，实现了 `readOnlyCacheMap` 的定时过期。
+
+> **注意**：应用实例注册、下线、过期时，不会很快刷新到 `readWriteCacheMap` 缓存里。默认配置下，最大延迟在 30 秒。
+
+**主动过期读写缓存**
+
+应用实例注册、下线、过期时，调用 `ResponseCacheImpl#invalidate()` 方法，主动过期读写缓存( `readWriteCacheMap` )
+
+**被动过期读写缓存**
+
+读写缓存( `readWriteCacheMap` ) 写入后，一段时间自动过期，实现代码如下：
+
+```
+expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds())
+```
+
+- 配置 `eureka.responseCacheAutoExpirationInSeconds` ，设置写入过期时长。默认值 ：180 秒
+
+**定时任务刷新只读缓存**
+
+定时任务对比 `readWriteCacheMap` 和 `readOnlyCacheMap` 的缓存值，若不一致，以前者为主。通过这样的方式，实现了 `readOnlyCacheMap` 的定时过期。实现代码如下：
+
+```java
+private TimerTask getCacheUpdateTask() {
+    return new TimerTask() {
+        @Override
+        public void run() {
+            logger.debug("Updating the client cache from response cache");
+            for (Key key : readOnlyCacheMap.keySet()) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("Updating the client cache from response cache for key : {} {} {} {}",
+                            key.getEntityType(), key.getName(), key.getVersion(), key.getType());
+                }
+                try {
+                    CurrentRequestVersion.set(key.getVersion());
+                    Value cacheValue = readWriteCacheMap.get(key);
+                    Value currentCacheValue = readOnlyCacheMap.get(key);
+                    if (cacheValue != currentCacheValue) {
+                        readOnlyCacheMap.put(key, cacheValue);
+                    }
+                } catch (Throwable th) {
+                    logger.error("Error while updating the client cache from response cache for key {}", key.toStringCompact(), th);
+                } finally {
+                    CurrentRequestVersion.remove();
+                }
+            }
+        }
+    };
+}
+```
+
+- 第 7 至 12 行 ：初始化定时任务。配置 `eureka.responseCacheUpdateIntervalMs`，设置任务执行频率，默认值 ：30 * 1000 毫秒。
+- 第 17 至 39 行 ：创建定时任务。
+  - 第 22 行 ：循环 `readOnlyCacheMap` 的缓存键。**为什么不循环 `readWriteCacheMap` 呢**？ `readOnlyCacheMap` 的缓存过期依赖 `readWriteCacheMap`，因此缓存键会更多。
+  - 第 28 行 至 33 行 ：对比 `readWriteCacheMap` 和 `readOnlyCacheMap` 的缓存值，若不一致，以前者为主。通过这样的方式，实现了 `readOnlyCacheMap` 的定时过期。
