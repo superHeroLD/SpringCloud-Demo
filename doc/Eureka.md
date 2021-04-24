@@ -512,7 +512,7 @@ private TimerTask getCacheUpdateTask() {
 }
 ```
 
-- 第 7 至 12 行 ：初始化定时任务。配置 `eureka.responseCacheUpdateIntervalMs`，设置任务执行频率，默认值 ：30 * 1000 毫秒。
-- 第 17 至 39 行 ：创建定时任务。
+- 初始化定时任务。配置 `eureka.responseCacheUpdateIntervalMs`，设置任务执行频率，默认值 ：30 * 1000 毫秒。
+- 定时任务逻辑
   - 第 22 行 ：循环 `readOnlyCacheMap` 的缓存键。**为什么不循环 `readWriteCacheMap` 呢**？ `readOnlyCacheMap` 的缓存过期依赖 `readWriteCacheMap`，因此缓存键会更多。
   - 第 28 行 至 33 行 ：对比 `readWriteCacheMap` 和 `readOnlyCacheMap` 的缓存值，若不一致，以前者为主。通过这样的方式，实现了 `readOnlyCacheMap` 的定时过期。
