@@ -516,3 +516,66 @@ private TimerTask getCacheUpdateTask() {
 - 定时任务逻辑
   - 第 22 行 ：循环 `readOnlyCacheMap` 的缓存键。**为什么不循环 `readWriteCacheMap` 呢**？ `readOnlyCacheMap` 的缓存过期依赖 `readWriteCacheMap`，因此缓存键会更多。
   - 第 28 行 至 33 行 ：对比 `readWriteCacheMap` 和 `readOnlyCacheMap` 的缓存值，若不一致，以前者为主。通过这样的方式，实现了 `readOnlyCacheMap` 的定时过期。
+
+#### Eureka-Client注册实例增量获取
+
+**应用一致性哈希码**
+
+`Applications.appsHashCode` ，应用集合**一致性哈希码**。增量获取注册的应用集合( Applications ) 时，Eureka-Client 会获取到：
+
+1. Eureka-Server 近期变化( 注册、下线 )的应用集合
+2. Eureka-Server 应用集合一致性哈希码
+
+Eureka-Client 将**变化**的应用集合和**本地缓存**的应用集合进行合并后进行计算本地的应用集合一致性哈希码。若两个**哈希码**相等，意味着增量获取成功；若不相等，意味着增量获取失败，Eureka-Client 重新和 Eureka-Server **全量**获取应用集合。
+
+计算公式为appsHashCode = ${status}_${count}_
+
+- 使用每个应用实例状态( `status` ) + 数量( `count` )拼接出一致性哈希码。若数量为 0 ，该应用实例状态不进行拼接。**状态以字符串大小排序**。
+- 举个例子，8 个 UP ，0 个 DOWN ，则 `appsHashCode = UP_8_` 。8 个 UP ，2 个 DOWN ，则 `appsHashCode = DOWN_2_UP_8_` 。
+
+**Eureka-Client发起增量获取**
+
+调用 `DiscoveryClient#getAndUpdateDelta(...)` 方法，**增量**获取注册信息，并**刷新**本地缓存。代码逻辑如下：
+
+- 请求增量获取注册信息，调用 `AbstractJerseyEurekaHttpClient#getApplicationsInternal(...)` 方法，GET 请求 Eureka-Server 的 `apps/detla` 接口，参数为 `regions` ，返回格式为 JSON ，实现增量获取注册信息。
+- 如果增量获取失败，那么就全量获取注册信息，并设置到北店缓存。
+- 处理增量获取结果
+  - `#updateDelta(...)` 方法，将**变化**的应用集合和本地缓存的应用集合进行合并。
+  - 判断一致性哈希值，调用 `#reconcileAndLogDifference()` 方法，全量获取注册信息，并设置到本地缓存，和 `#getAndStoreFullRegistry()` 基本类似。
+  - 配置 `eureka.printDeltaFullDiff` ，是否打印增量和全量差异。默认值 ：`false` 。从目前代码实现上来看，暂时没有生效。**注意** ：开启该参数会导致每次**增量**获取后又发起**全量**获取，不要开启。
+
+**合并应用集合**
+
+调用 `#updateDelta(...)` 方法，将变化的应用集合本地缓存的应用集合进行合并。最终放到`Application`类下`Map<String, InstanceInfo> instancesMap`中。
+
+#### Eureka-Server处理增量获取请求
+
+通过`ApplicationsRescoure#getContainerDifferential()`方法处理增量获取请求，`ResponseCacheImpl`会根据不同的key由不同的缓存处理逻辑，对应的代码在``ResponseCacheImpl#ResponseCacheImpl()`的构造方法中，在初始化readWriteCacheMap时有一段代码如下：
+
+```java
+.build(new CacheLoader<Key, Value>() {
+    @Override
+    public Value load(Key key) throws Exception {
+        if (key.hasRegions()) {
+            Key cloneWithNoRegions = key.cloneWithoutRegions();
+            regionSpecificKeys.put(cloneWithNoRegions, key);
+        }
+        Value value = generatePayload(key);
+        return value;
+    }
+});
+```
+
+其中`generatePayload(key)`方法有不同的key对应的缓存的生成逻辑。值得注意的是增量拉取注册信息的时候，Eureka通过维护一个最近租约变更队列维护了增量信息。
+
+**最近租约变更队列**
+
+`AbstractInstanceRegistry.recentlyChangedQueue`，最近租约变更记录队列。ConcurrentLinkedQueue<RecentlyChangedItem> recentlyChangedQueue.`RecentlyChangedItem`中维护了最近租约变更的服务实例信息。具体逻辑如下：
+
+- 当应用实例注册、下线、状态变更时，创建最近租约变更记录( RecentlyChangedItem ) 到队列。
+- 后台任务定时**顺序**扫描队列，当 `lastUpdateTime` 超过一定时长后进行移除。
+- 配置 `eureka.deltaRetentionTimerIntervalInMs`， 移除队列里过期的租约变更记录的定时任务执行频率，单位：毫秒。默认值 ：30 * 1000 毫秒。
+
+**读取缓存**
+
+在 `#generatePayload()` 方法里，调用`getApplicationDeltasFromMultipleRegions()`和`getApplicationDeltas()`方法获取近期变化的应用集合。具体的方式就是获取最近租约变化对别中的数据，然后拼装变化的应用集合，然后返回数据。
