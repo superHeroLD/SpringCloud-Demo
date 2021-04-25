@@ -305,6 +305,8 @@ private class HeartbeatThread implements Runnable {
 
 各种判断续租是否成功，如果成功了会将应用续租信息进行集群同步，最终续租信息也会展示在Eureka的管理端页面上。
 
+续租的最终逻辑就是改变了一个续租的时间戳，把当前时间戳延长一个配置时间，默认是90S。
+
 #### Eureka-Client获取注册信息
 
 **Applications**封装由Eureka服务器返回的所有注册表信息的类，在获取后会进行混洗，然后根据`InstanceStatus＃UP`状态进行过滤。
@@ -573,9 +575,59 @@ Eureka-Client 将**变化**的应用集合和**本地缓存**的应用集合进�
 `AbstractInstanceRegistry.recentlyChangedQueue`，最近租约变更记录队列。ConcurrentLinkedQueue<RecentlyChangedItem> recentlyChangedQueue.`RecentlyChangedItem`中维护了最近租约变更的服务实例信息。具体逻辑如下：
 
 - 当应用实例注册、下线、状态变更时，创建最近租约变更记录( RecentlyChangedItem ) 到队列。
-- 后台任务定时**顺序**扫描队列，当 `lastUpdateTime` 超过一定时长后进行移除。
+- 后台任务定时**顺序**扫描队列，当 `lastUpdateTime` 超过一定时长（3分钟，可配置）后进行移除。
 - 配置 `eureka.deltaRetentionTimerIntervalInMs`， 移除队列里过期的租约变更记录的定时任务执行频率，单位：毫秒。默认值 ：30 * 1000 毫秒。
 
 **读取缓存**
 
 在 `#generatePayload()` 方法里，调用`getApplicationDeltasFromMultipleRegions()`和`getApplicationDeltas()`方法获取近期变化的应用集合。具体的方式就是获取最近租约变化对别中的数据，然后拼装变化的应用集合，然后返回数据。
+
+#### Eureka-Client发起下线
+
+应用实例关闭时，Eureka-Client 向 Eureka-Server 发起下线应用实例。需要满足如下条件才可发起：
+
+- 配置 `eureka.registration.enabled = true` ，应用实例开启注册开关。默认为 `false` 。
+- 配置 `eureka.shouldUnregisterOnShutdown = true` ，应用实例开启关闭时下线开关。默认为 `true` 。
+
+调用`DiscoveryClient#shutdown()`方法关闭实例
+
+- 调用 `ApplicationInfoManager#setInstanceStatus(...)` 方法，设置应用实例为关闭( DOWN )。
+- 调用 `#unregister()` 方法，在方法中`AbstractJerseyEurekaHttpClient#cancel(...)` 方法，`DELETE` 请求 Eureka-Server 的 `apps/${APP_NAME}/${INSTANCE_INFO_ID}` 接口，实现应用实例信息的下线。
+
+##### Eureka-Server处理下线
+
+`InstanceResource`，处理**单个**应用实例信息的请求操作的 Resource。线应用实例信息的请求，映射 `InstanceResource#cancelLease()` 方法，调用 `PeerAwareInstanceRegistryImpl#cancel(...)` 方法，下线应用实例。
+
+```java
+public boolean cancel(final String appName, final String id, final boolean isReplication) {
+    if (super.cancel(appName, id, isReplication)) {
+        replicateToPeers(Action.Cancel, appName, id, null, null, isReplication);
+        return true;
+    }
+    return false;
+}
+```
+
+- 调用父类 `AbstractInstanceRegistry#cancel(...)` 方法，下线应用实例信息。
+- Eureka-Server集群复制下线操作。
+- 减少 `numberOfRenewsPerMinThreshold` 、`expectedNumberOfRenewsPerMin`，自我保护机制相关。
+
+##### 下线应用实例信息
+
+调用 `AbstractInstanceRegistry#cancel(...)` 方法，下线应用实例信息，具体逻辑如下：
+
+- 移除本地租约信息
+- 添加到最近下线的调试队列( `recentCanceledQueue` )，用于 Eureka-Server 运维界面的显示，无实际业务逻辑使用。
+- 移除应用实例覆盖状态映射。
+- 调用 `Lease#cancel()` 方法，取消租约。
+
+```java
+public void cancel() {
+    if (evictionTimestamp <= 0) {
+        evictionTimestamp = System.currentTimeMillis();
+    }
+}
+```
+
+- 设置应用实例信息的操作类型为添加，并添加到最近租约变更记录队列( `recentlyChangedQueue` )。`recentlyChangedQueue` 用于注册信息的增量获取
+- 设置响应缓存( ResponseCache )过期，`invalidateCache(appName, vip, svip)`这个方法比较重要。
