@@ -644,3 +644,5 @@ public void cancel() {
 >
 > 在Spring Cloud中，可以使用`eureka.server.enable-self-preservation = false` 禁用自我保护模式。
 
+### Eureka批任务处理
+
