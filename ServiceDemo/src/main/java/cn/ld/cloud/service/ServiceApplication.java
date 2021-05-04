@@ -12,18 +12,10 @@ import org.springframework.web.client.RestTemplate;
  * @author lidong
  * @date 2021/1/11
  */
-//@EnableFeignClients(basePackages = "cn.ld.cloud.service")
-@EnableFeignClients
+@EnableFeignClients(basePackages = "cn.ld.cloud.api")
 @EnableEurekaClient
 @SpringBootApplication
 public class ServiceApplication {
-
-    @Bean
-    @LoadBalanced
-    RestTemplate restTemplate() {
-        return new RestTemplate();
-    }
-
     public static void main(String[] args) {
         SpringApplication.run(ServiceApplication.class, args);
     }

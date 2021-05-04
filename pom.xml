@@ -21,6 +21,7 @@
         <module>DiscoveryDemo</module>
         <module>ServiceDemo</module>
         <module>AnotherServiceDemo</module>
+        <module>AnotherServiceApi</module>
     </modules>
 
     <developers>
