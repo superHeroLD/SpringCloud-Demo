@@ -171,5 +171,167 @@ try {
 
 具体的请求是通过`LoadBalancerRequestAdapter`发出的，随后返回了请求信息。
 
-> 这里我有个猜测，我的项目中引入的是spring-cloud-starter-netflix-eureka-client这个包，这里没有用Ribbon，所以可以看出Eureka-Client本身也是提供负载均衡服务的，只不过提供的比较少，就两种方式。第二点，SpringCloud还是有点厉害的，自动装配会根据一些配置条件自动的进行服务配置。比如没有Ribbon的时候，就用Eureka-Client自带的负载均衡，有了之后会不会直接用Ribbon的？
+> 这里我有个猜测，我的项目中引入的是spring-cloud-starter-netflix-eureka-client这个包，这里没有用Ribbon，所以可以看出Eureka-Client本身也是提供负载均衡服务的，只不过提供的比较少，就两种方式。第二点，SpringCloud还是有点厉害的，自动装配会根据一些配置条件自动的进行服务配置。比如没有Ribbon的时候，就用Eureka-Client自带的负载均衡，有了之后会不会直接用Ribbon的？需要根据配置哦
 
+### 引入了Ribbon的自动装配流程
+
+```java
+@Configuration
+@Conditional(RibbonAutoConfiguration.RibbonClassesConditions.class)
+@RibbonClients
+@AutoConfigureAfter(
+      name = "org.springframework.cloud.netflix.eureka.EurekaClientAutoConfiguration")
+@AutoConfigureBefore({ LoadBalancerAutoConfiguration.class,
+      AsyncLoadBalancerAutoConfiguration.class })
+@EnableConfigurationProperties({ RibbonEagerLoadProperties.class,
+      ServerIntrospectorProperties.class })
+//一般都是通过这个配置开启Ribbon负载的
+@ConditionalOnProperty(value = "spring.cloud.loadbalancer.ribbon.enabled",
+      havingValue = "true", matchIfMissing = true)
+```
+
+在项目中引入了Ribbon的时候，Spring在启动时就会根据条件自动执行Ribbon的自动装配类`RibbonAutoConfiguration`。前面的过程基本上与上面写的都相同，只不过在自动装配`LoadBalancerAutoConfiguration`中时，向其中注入的LoadBalancerClient类是`org.springframework.cloud.netflix.ribbon.RibbonLoadBalancerClient`,随后执行`RibbonLoadBalancerClient#execute()`方法。
+
+```java
+public <T> T execute(String serviceId, LoadBalancerRequest<T> request, Object hint)
+      throws IOException {
+  //获取负载均衡算法
+   ILoadBalancer loadBalancer = getLoadBalancer(serviceId);
+   Server server = getServer(loadBalancer, hint);
+   if (server == null) {
+      throw new IllegalStateException("No instances available for " + serviceId);
+   }
+   RibbonServer ribbonServer = new RibbonServer(serviceId, server,
+         isSecure(server, serviceId),
+         serverIntrospector(serviceId).getMetadata(server));
+
+   return execute(serviceId, ribbonServer, request);
+}
+```
+
+方法执行逻辑如下：
+
+- 获取负载均衡算法（默认是ZoneAwareLoadBalancer）
+- 根据负载均衡算法选取需要执行的Server
+- 封装参数RibbonServer
+- 执行实际的Http调用
+
+#### getLoadBalancer选择负载均衡算法流程
+
+```java
+protected ILoadBalancer getLoadBalancer(String serviceId) {
+   return this.clientFactory.getLoadBalancer(serviceId);
+}
+```
+
+具体的逻辑就是从SpringClientFactory中根据配置获取`ILoadBalancer`，Ribbon中默认获取的是ZoneAwareLoadBalancer。在看ZoneAwareLoadBalancer的源码时发现`setServerListForZones()`方法，这个放过就应该是初始化了服务列表，重点看下这里的逻辑。
+
+```java
+@Override
+protected void setServerListForZones(Map<String, List<Server>> zoneServersMap) {
+    super.setServerListForZones(zoneServersMap);
+    if (balancers == null) {
+        balancers = new ConcurrentHashMap<String, BaseLoadBalancer>();
+    }
+    for (Map.Entry<String, List<Server>> entry: zoneServersMap.entrySet()) {
+       String zone = entry.getKey().toLowerCase();
+        getLoadBalancer(zone).setServersList(entry.getValue());
+    }
+    // check if there is any zone that no longer has a server
+    // and set the list to empty so that the zone related metrics does not
+    // contain stale data
+    for (Map.Entry<String, BaseLoadBalancer> existingLBEntry: balancers.entrySet()) {
+        if (!zoneServersMap.keySet().contains(existingLBEntry.getKey())) {
+            existingLBEntry.getValue().setServersList(Collections.emptyList());
+        }
+    }
+}  
+```
+
+这里有一行代码super.setServerListForZones(zoneServersMap)直观上就感觉这里获取了所有的服务列表，跟着跳转到父类`DynamicServerListLoadBalancer`方法setServerListForZones()
+
+```java
+protected void setServerListForZones(
+        Map<String, List<Server>> zoneServersMap) {
+    LOGGER.debug("Setting server list for zones: {}", zoneServersMap);
+    getLoadBalancerStats().updateZoneServerMapping(zoneServersMap);
+}
+
+ public void updateZoneServerMapping(Map<String, List<Server>> map) {
+        upServerListZoneMap = new ConcurrentHashMap<String, List<? extends Server>>(map);
+        // make sure ZoneStats object exist for available zones for monitoring purpose
+        for (String zone: map.keySet()) {
+            getZoneStats(zone);
+        }
+ }
+```
+
+发现所有的服务列表应该在此之前就已经初始化了，但是找了半天通过Debug发现在`DynamicServerListLoadBalancer`初始化的时候构造方法中通过 restOfInit(clientConfig)方法加载的所有服务端列表。
+
+```java
+public DynamicServerListLoadBalancer(IClientConfig clientConfig, IRule rule, IPing ping,
+                                     ServerList<T> serverList, ServerListFilter<T> filter,
+                                     ServerListUpdater serverListUpdater) {
+    super(clientConfig, rule, ping);
+    this.serverListImpl = serverList;
+    this.filter = filter;
+    this.serverListUpdater = serverListUpdater;
+    if (filter instanceof AbstractServerListFilter) {
+        ((AbstractServerListFilter) filter).setLoadBalancerStats(getLoadBalancerStats());
+    }
+    restOfInit(clientConfig);
+}
+```
+
+跟着这个方法一步步走下去`updateListOfServers()`,然后到`DiscoveryEnabledNIWSServerList#getUpdatedListOfServers()`方法中。
+
+```java
+private List<DiscoveryEnabledServer> obtainServersViaDiscovery() {
+    List<DiscoveryEnabledServer> serverList = new ArrayList<DiscoveryEnabledServer>();
+
+    if (eurekaClientProvider == null || eurekaClientProvider.get() == null) {
+        logger.warn("EurekaClient has not been initialized yet, returning an empty list");
+        return new ArrayList<DiscoveryEnabledServer>();
+    }
+
+    EurekaClient eurekaClient = eurekaClientProvider.get();
+    if (vipAddresses!=null){
+        for (String vipAddress : vipAddresses.split(",")) {
+            // if targetRegion is null, it will be interpreted as the same region of client
+            List<InstanceInfo> listOfInstanceInfo = eurekaClient.getInstancesByVipAddress(vipAddress, isSecure, targetRegion);
+            for (InstanceInfo ii : listOfInstanceInfo) {
+                if (ii.getStatus().equals(InstanceStatus.UP)) {
+
+                    if(shouldUseOverridePort){
+                        if(logger.isDebugEnabled()){
+                            logger.debug("Overriding port on client name: " + clientName + " to " + overridePort);
+                        }
+
+                        // copy is necessary since the InstanceInfo builder just uses the original reference,
+                        // and we don't want to corrupt the global eureka copy of the object which may be
+                        // used by other clients in our system
+                        InstanceInfo copy = new InstanceInfo(ii);
+
+                        if(isSecure){
+                            ii = new InstanceInfo.Builder(copy).setSecurePort(overridePort).build();
+                        }else{
+                            ii = new InstanceInfo.Builder(copy).setPort(overridePort).build();
+                        }
+                    }
+
+                    DiscoveryEnabledServer des = createServer(ii, isSecure, shouldUseIpAddr);
+                    serverList.add(des);
+                }
+            }
+            if (serverList.size()>0 && prioritizeVipAddressBasedServers){
+                break; // if the current vipAddress has servers, we dont use subsequent vipAddress based servers
+            }
+        }
+    }
+    return serverList;
+}
+```
+
+可以看出最终Ribbon也是通过Eureka-Client从Eureak中获取了所有的服务信息。
+
+备注：看源码的时候我还发现了集中别的获取服务器地址的方式，比如`ConfigurationBasedServerList`可以通过配置获取服务器地址信息，用逗号分隔开。其他的还有 `DomainExtractingServerList`、`StaticServerList`（直接通过代码构造）
