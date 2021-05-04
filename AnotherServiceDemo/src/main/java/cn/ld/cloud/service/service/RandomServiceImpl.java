@@ -1,8 +1,8 @@
-package cn.ld.cloud.service.api;
+package cn.ld.cloud.service.service;
 
+import cn.ld.cloud.api.RandomService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.concurrent.ThreadLocalRandom;
@@ -13,11 +13,10 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 @Slf4j
 @RestController
-@RequestMapping("/random")
-public class RandomController {
+public class RandomServiceImpl implements RandomService {
 
-    @GetMapping("/getRandomNum")
-    public int getRandomNum() {
+    @Override
+    public Integer getRandomNum() {
         return ThreadLocalRandom.current().nextInt(10000);
     }
 }
