@@ -283,6 +283,26 @@ public DynamicServerListLoadBalancer(IClientConfig clientConfig, IRule rule, IPi
 }
 ```
 
+```java
+void restOfInit(IClientConfig clientConfig) {
+    boolean primeConnection = this.isEnablePrimingConnections();
+    // turn this off to avoid duplicated asynchronous priming done in BaseLoadBalancer.setServerList()
+    this.setEnablePrimingConnections(false);
+  
+  //从Eureka中同步注册信息任务，
+    enableAndInitLearnNewServersFeature();
+  
+  //从Eureka中获取服务注册信息
+    updateListOfServers();
+    if (primeConnection && this.getPrimeConnections() != null) {
+        this.getPrimeConnections()
+                .primeConnections(getReachableServers());
+    }
+    this.setEnablePrimingConnections(primeConnection);
+    LOGGER.info("DynamicServerListLoadBalancer for client {} initialized: {}", clientConfig.getClientName(), this.toString());
+}
+```
+
 跟着这个方法一步步走下去`updateListOfServers()`,然后到`DiscoveryEnabledNIWSServerList#getUpdatedListOfServers()`方法中。
 
 ```java
@@ -334,4 +354,104 @@ private List<DiscoveryEnabledServer> obtainServersViaDiscovery() {
 
 可以看出最终Ribbon也是通过Eureka-Client从Eureak中获取了所有的服务信息。
 
-备注：看源码的时候我还发现了集中别的获取服务器地址的方式，比如`ConfigurationBasedServerList`可以通过配置获取服务器地址信息，用逗号分隔开。其他的还有 `DomainExtractingServerList`、`StaticServerList`（直接通过代码构造）
+> 备注：看源码的时候我还发现了集中别的获取服务器地址的方式，比如`ConfigurationBasedServerList`可以通过配置获取服务器地址信息，用逗号分隔开。其他的还有 `DomainExtractingServerList`、`StaticServerList`（直接通过代码构造）
+
+总结一下：Ribbon中，在加载ILoadBalancer时，就会通过Eureka初始化好对应的服务器列表。不过还有几个问题没弄太明白，比如SpringClientFacotry中的每个服务对应的ApplicationContext是怎么回事？
+
+#### Ribbon持续获取Eureka的服务信息
+
+Eureka中的服务注册信息也会不断的改变，所以Ribbon也会不断的进行同步到自己本地。同步的位置就在于`DynamicServerListLoadBalancer#restOfInit()#enableAndInitLearnNewServersFeature()`方法中，
+
+```java
+public void enableAndInitLearnNewServersFeature() {
+    LOGGER.info("Using serverListUpdater {}", serverListUpdater.getClass().getSimpleName());
+    serverListUpdater.start(updateAction);
+}
+```
+
+其中serverListUpdater是`PollingServerListUpdater`在这里，创建了一个线程，每隔一定的时间（30秒）就会执行updateAction的逻辑，其中updateAction如下
+
+```java
+protected final ServerListUpdater.UpdateAction updateAction = new ServerListUpdater.UpdateAction() {
+    @Override
+    public void doUpdate() {
+        updateListOfServers();
+    }
+};
+```
+
+就是调用了updateListOfServers()放大去Eureka中拉取服务注册表。
+
+#### Ribbon选择一个Server出来
+
+Server server = getServer(loadBalancer, hint)这行代码就是通过负载均衡算法选择一个Server出来，以`ZoneAwareLoadBalancer`算法为例
+
+```java
+public Server chooseServer(Object key) {
+    if (!ENABLED.get() || getLoadBalancerStats().getAvailableZones().size() <= 1) {
+        logger.debug("Zone aware logic disabled or there is only one zone");
+        return super.chooseServer(key);
+    }
+    Server server = null;
+    try {
+        LoadBalancerStats lbStats = getLoadBalancerStats();
+        Map<String, ZoneSnapshot> zoneSnapshot = ZoneAvoidanceRule.createSnapshot(lbStats);
+        logger.debug("Zone snapshots: {}", zoneSnapshot);
+        if (triggeringLoad == null) {
+            triggeringLoad = DynamicPropertyFactory.getInstance().getDoubleProperty(
+                    "ZoneAwareNIWSDiscoveryLoadBalancer." + this.getName() + ".triggeringLoadPerServerThreshold", 0.2d);
+        }
+
+        if (triggeringBlackoutPercentage == null) {
+            triggeringBlackoutPercentage = DynamicPropertyFactory.getInstance().getDoubleProperty(
+                    "ZoneAwareNIWSDiscoveryLoadBalancer." + this.getName() + ".avoidZoneWithBlackoutPercetage", 0.99999d);
+        }
+        Set<String> availableZones = ZoneAvoidanceRule.getAvailableZones(zoneSnapshot, triggeringLoad.get(), triggeringBlackoutPercentage.get());
+        logger.debug("Available zones: {}", availableZones);
+        if (availableZones != null &&  availableZones.size() < zoneSnapshot.keySet().size()) {
+            String zone = ZoneAvoidanceRule.randomChooseZone(zoneSnapshot, availableZones);
+            logger.debug("Zone chosen: {}", zone);
+            if (zone != null) {
+                BaseLoadBalancer zoneLoadBalancer = getLoadBalancer(zone);
+                server = zoneLoadBalancer.chooseServer(key);
+            }
+        }
+    } catch (Exception e) {
+        logger.error("Error choosing server using zone aware logic for load balancer={}", name, e);
+    }
+    if (server != null) {
+        return server;
+    } else {
+        logger.debug("Zone avoidance logic is not invoked.");
+        return super.chooseServer(key);
+    }
+}
+```
+
+核心选取算法会调用super.chooseServer(key)方法，这个方法会最终调用到父类BaseLoadBalancer中的chooseServer方法，最终通过rule.choose(key)方法选取服务器。
+
+```java
+public Server chooseServer(Object key) {
+    if (counter == null) {
+        counter = createCounter();
+    }
+    counter.increment();
+    if (rule == null) {
+        return null;
+    } else {
+        try {
+            return rule.choose(key);
+        } catch (Exception e) {
+            logger.warn("LoadBalancer [{}]:  Error choosing server for key {}", name, key, e);
+            return null;
+        }
+    }
+}
+```
+
+```java
+protected IRule rule = DEFAULT_RULE;
+private final static IRule DEFAULT_RULE = new RoundRobinRule();
+```
+
+最终看到IRule就是RoundRobinRule()，应该就是轮训算法。
