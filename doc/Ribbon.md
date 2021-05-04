@@ -455,3 +455,248 @@ private final static IRule DEFAULT_RULE = new RoundRobinRule();
 ```
 
 最终看到IRule就是RoundRobinRule()，应该就是轮训算法。
+
+#### 重写URL发送HTTP请求
+
+流程继续往下走，目前已经选定了要发送的Server信息，接下来就是要根据Server实际的Url和端口替换掉原来url中的信息。在`RibbonLoadBalancerClient#execute()`方法中执行具体的Http请求。
+
+```java
+public <T> T execute(String serviceId, ServiceInstance serviceInstance,
+      LoadBalancerRequest<T> request) throws IOException {
+   Server server = null;
+   if (serviceInstance instanceof RibbonServer) {
+      server = ((RibbonServer) serviceInstance).getServer();
+   }
+   if (server == null) {
+      throw new IllegalStateException("No instances available for " + serviceId);
+   }
+
+   RibbonLoadBalancerContext context = this.clientFactory
+         .getLoadBalancerContext(serviceId);
+   RibbonStatsRecorder statsRecorder = new RibbonStatsRecorder(context, server);
+
+   try {
+      T returnVal = request.apply(serviceInstance);
+      statsRecorder.recordStats(returnVal);
+      return returnVal;
+   }
+  //省略掉一些异常代码
+}
+```
+
+这里通过request.apply(serviceInstance)调用发送Http请求
+
+```java
+@Override
+public ListenableFuture<ClientHttpResponse> intercept(final HttpRequest request,
+      final byte[] body, final AsyncClientHttpRequestExecution execution)
+      throws IOException {
+   final URI originalUri = request.getURI();
+   String serviceName = originalUri.getHost();
+   return this.loadBalancer.execute(serviceName,
+         new LoadBalancerRequest<ListenableFuture<ClientHttpResponse>>() {
+            @Override
+            public ListenableFuture<ClientHttpResponse> apply(
+                  final ServiceInstance instance) throws Exception {
+               HttpRequest serviceRequest = new ServiceRequestWrapper(request,
+                     instance, AsyncLoadBalancerInterceptor.this.loadBalancer);
+               return execution.executeAsync(serviceRequest, body);
+            }
+
+         });
+}
+```
+
+最终通过`ServiceRequestWrapper`把请求出一个新的HttpRequest，在ServiceRequestWrapper中将根据服务实例信息和请求信息修改URL比如http://ServerA/XXX变为http://localhost:8080/XXX
+
+```java
+@Override
+public URI getURI() {
+   URI uri = this.loadBalancer.reconstructURI(this.instance, getRequest().getURI());
+   return uri;
+}
+```
+
+最终通过`AsyncClientHttpRequestExecution`将请求发出去。
+
+到这里Ribbon负载均衡的大体流程就梳理完毕了，简单总结一下在没用Feign的情况下，Ribbon + Eureka处理负载均衡请求的流程如下
+
+- Spring中Eureka Client或者Ribbon的自动装配会为RestTemplate里增加一个拦截器。这个拦截器会拦截每个Http请求进行负载均衡处理。拦截器会自动注入LoadBalanceClient，这个由Eureka Client或Ribbon具体实现。
+- Ribbon的负载均衡Client主要负责加载对应的负载均衡算法并执行Http请求。这里有一些细节
+  1. Ribbon的负载均衡算法会在初始化的时候就从Eureka中获取所有服务列表
+  2. SpringCloud中每个服务都会有一个对应的ApplicationContext（但是具体有什么用）目前只知道可以从这里取出对应的负载均衡算法
+  3. Ribbon负载均衡算法会在启动后启动一个`PollingServerListUpdater`定时任务，默认每30S就从Eureka中同步一下服务注册信息
+  4. 通过负载均衡算法Ribbon会从中选取一台机器用于Http请求。
+  5. 通过选取的服务信息和请求的URL，Ribbon会重新组装一个新的HttpRequest（ServiceRequestWrapper）修改URL，同时用修改后的Url发起Http（看代码这里的请求还是一个异步的请求）
+
+#### Ribbon ping机制
+
+`BaseLoadBalancer`在构造方法中会执行`initWithConfig`方法
+
+```java
+void initWithConfig(IClientConfig clientConfig, IRule rule, IPing ping, LoadBalancerStats stats) {
+    this.config = clientConfig;
+    String clientName = clientConfig.getClientName();
+    this.name = clientName;
+    int pingIntervalTime = Integer.parseInt(""
+            + clientConfig.getProperty(
+                    CommonClientConfigKey.NFLoadBalancerPingInterval,
+                    Integer.parseInt("30")));
+    int maxTotalPingTime = Integer.parseInt(""
+            + clientConfig.getProperty(
+                    CommonClientConfigKey.NFLoadBalancerMaxTotalPingTime,
+                    Integer.parseInt("2")));
+
+    setPingInterval(pingIntervalTime);
+    setMaxTotalPingTime(maxTotalPingTime);
+
+    // cross associate with each other
+    // i.e. Rule,Ping meet your container LB
+    // LB, these are your Ping and Rule guys ...
+    setRule(rule);
+    setPing(ping);
+
+    setLoadBalancerStats(stats);
+    rule.setLoadBalancer(this);
+    if (ping instanceof AbstractLoadBalancerPing) {
+        ((AbstractLoadBalancerPing) ping).setLoadBalancer(this);
+    }
+    logger.info("Client: {} instantiated a LoadBalancer: {}", name, this);
+    boolean enablePrimeConnections = clientConfig.get(
+            CommonClientConfigKey.EnablePrimeConnections, DefaultClientConfigImpl.DEFAULT_ENABLE_PRIME_CONNECTIONS);
+
+    if (enablePrimeConnections) {
+        this.setEnablePrimingConnections(true);
+        PrimeConnections primeConnections = new PrimeConnections(
+                this.getName(), clientConfig);
+        this.setPrimeConnections(primeConnections);
+    }
+    init();
+
+}
+```
+
+在initWithConfig方法中会设置IPing，在setPing方法中会调用`setupPingTask`方法设置ping任务。
+
+```java
+void setupPingTask() {
+    if (canSkipPing()) {
+        return;
+    }
+    if (lbTimer != null) {
+        lbTimer.cancel();
+    }
+    lbTimer = new ShutdownEnabledTimer("NFLoadBalancer-PingTimer-" + name,
+            true);
+    lbTimer.schedule(new PingTask(), 0, pingIntervalSeconds * 1000);
+    forceQuickPing();
+}
+```
+
+这里的逻辑就是每10S执行一次PingTask任务。
+
+```java
+class PingTask extends TimerTask {
+    public void run() {
+        try {
+           new Pinger(pingStrategy).runPinger();
+        } catch (Exception e) {
+            logger.error("LoadBalancer [{}]: Error pinging", name, e);
+        }
+    }
+}
+```
+
+```java
+    public void runPinger() throws Exception {
+        if (!pingInProgress.compareAndSet(false, true)) { 
+            return; // Ping in progress - nothing to do
+        }
+        
+        // we are "in" - we get to Ping
+
+        Server[] allServers = null;
+        boolean[] results = null;
+
+        Lock allLock = null;
+        Lock upLock = null;
+
+        try {
+            /*
+             * The readLock should be free unless an addServer operation is
+             * going on...
+             */
+            allLock = allServerLock.readLock();
+            allLock.lock();
+            allServers = allServerList.toArray(new Server[allServerList.size()]);
+            allLock.unlock();
+
+            int numCandidates = allServers.length;
+          //这里就是调用了具体IPing接口的isAlive方法判断服务状态
+            results = pingerStrategy.pingServers(ping, allServers);
+
+            final List<Server> newUpList = new ArrayList<Server>();
+            final List<Server> changedServers = new ArrayList<Server>();
+
+            for (int i = 0; i < numCandidates; i++) {
+                boolean isAlive = results[i];
+                Server svr = allServers[i];
+                boolean oldIsAlive = svr.isAlive();
+
+                svr.setAlive(isAlive);
+
+                if (oldIsAlive != isAlive) {
+                    changedServers.add(svr);
+                    logger.debug("LoadBalancer [{}]:  Server [{}] status changed to {}", 
+                      name, svr.getId(), (isAlive ? "ALIVE" : "DEAD"));
+                }
+
+                if (isAlive) {
+                    newUpList.add(svr);
+                }
+            }
+            upLock = upServerLock.writeLock();
+            upLock.lock();
+            upServerList = newUpList;
+            upLock.unlock();
+
+            notifyServerStatusChangeListener(changedServers);
+        } finally {
+            pingInProgress.set(false);
+        }
+    }
+}
+```
+
+PingTask任务的具体逻辑就是依次对每个服务调用IPing接口中的isAlive方法然后更新本地服务列表的状态。
+
+Ribbon的默认IPing实现是`DummyPing`，具体实现就是直接返回true，其实就是不做任何操作不剔除任何服务实例。
+
+```java
+public boolean isAlive(Server server) {
+    return true;
+}
+```
+
+在Ribbon启用了注册中心后，那么就会使用`NIWSDiscoveryPing`这个类。
+
+```java
+public boolean isAlive(Server server) {
+    boolean isAlive = true;
+    if (server!=null && server instanceof DiscoveryEnabledServer){
+           DiscoveryEnabledServer dServer = (DiscoveryEnabledServer)server;                
+           InstanceInfo instanceInfo = dServer.getInstanceInfo();
+           if (instanceInfo!=null){                    
+               InstanceStatus status = instanceInfo.getStatus();
+               if (status!=null){
+                   isAlive = status.equals(InstanceStatus.UP);
+               }
+           }
+       }
+    return isAlive;
+}
+```
+
+这给类就是调用注册中心的接口，然后获取服务状态来实现ping的逻辑。
+
+由此可知也可以自己实现IPing然后装配到Spring中，从而实现自己想要的服务探活逻辑。
