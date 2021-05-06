@@ -292,7 +292,7 @@ protected Feign.Builder feign(FeignContext context) {
 public Feign.Builder feignHystrixBuilder() {
    return HystrixFeign.builder();
 }
-//跟重试相关
+//跟重试相关,默认Builder，配置是从来不重试
 	@Bean
 	@Scope("prototype")
 	@ConditionalOnMissingBean
@@ -448,6 +448,7 @@ protected static class HystrixFeignTargeterConfiguration {
 public <T> T target(FeignClientFactoryBean factory, Feign.Builder feign,
       FeignContext context, Target.HardCodedTarget<T> target) {
    if (!(feign instanceof feign.hystrix.HystrixFeign.Builder)) {
+     //如果没配置Hystrix的话，那么就会走这里
       return feign.target(target);
    }
    feign.hystrix.HystrixFeign.Builder builder = (feign.hystrix.HystrixFeign.Builder) feign;
@@ -457,6 +458,8 @@ public <T> T target(FeignClientFactoryBean factory, Feign.Builder feign,
    if (setterFactory != null) {
       builder.setterFactory(setterFactory);
    }
+  
+  //Hystrix中的降级相关
    Class<?> fallback = factory.getFallback();
    if (fallback != void.class) {
       return targetWithFallback(name, context, target, builder, fallback);
