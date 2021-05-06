@@ -153,6 +153,7 @@ private void registerFeignClient(BeanDefinitionRegistry registry,
                      : ClassUtils.resolveClassName(fallbackFactory.toString(),
                            null));
             }
+           //注意这里！！！直接就调用了FactoryBean.getObject方法
             return factoryBean.getObject();
          });
    definition.setAutowireMode(AbstractBeanDefinition.AUTOWIRE_BY_TYPE);
@@ -182,7 +183,7 @@ private void registerFeignClient(BeanDefinitionRegistry registry,
 
 `registerFeignClient()`方法其实主要做了两件事
 
-- 生成了`FeignClientFactoryBean`FeignClient的FactoryBean，这里猜测一下，应该是后面用户在代码中自动注入对应的FeignClient时，Spring就会通过对应的FactoryBean的`getObject()`方法生成对应的动态代理注入到代码中。在实际使用的过程中，也是使用的动态代理进行Http调用。
+- 生成了`FeignClientFactoryBean`FeignClient的FactoryBean，然后通过对应的FactoryBean的`getObject()`方法生成对应的动态代理注入到Spring，在这一步会把所有FeignClient的功能与Ribbon之类的相关功能都整合初始化完毕。在实际使用的过程中，应该是使用的动态代理进行Http调用就行了。
 - 生成了BeanDefinition注册到Spring中，通过`BeanDefinitionReaderUtils.registerBeanDefinition()`最终注册到`DefaultListableBeanFactory`中的`private final Map<String, BeanDefinition> beanDefinitionMap = new ConcurrentHashMap<>(256);`中。
 
 ### FeignClientFactoryBean方法getObject() 方法
@@ -199,9 +200,11 @@ public Object getObject() {
  * information
  */
 <T> T getTarget() {
+  //获取FeignContext
    FeignContext context = beanFactory != null
          ? beanFactory.getBean(FeignContext.class)
          : applicationContext.getBean(FeignContext.class);
+  //构建Feign.Builder
    Feign.Builder builder = feign(context);
 
    if (!StringUtils.hasText(url)) {
@@ -252,5 +255,227 @@ public Object getObject() {
 }
 ```
 
-这段代码简单的过一遍，就是FactoryBean根据FeignContext构建不同类型的FeignClient。比如`LoadBalancerFeignClient`、`FeignBlockingLoadBalancerClient`等等。
+首先FeignContext，这里的FeginContext应该类似于SpringClientFacotry，每个FeignClient都对应了一个FeginContext，里面存了类似于`FeignClientsConfiguration`配置相关的信息。因为底层就是一个Map，Key对应的就是FeignClient的Name，Value是对应的配置。
+
+然后`Feign.Builder builder = feign(context)`构建了一个`Feign.Builder`。
+
+#### Feign.Builder构建过程
+
+```java
+protected Feign.Builder feign(FeignContext context) {
+   FeignLoggerFactory loggerFactory = get(context, FeignLoggerFactory.class);
+   Logger logger = loggerFactory.create(type);
+
+   // @formatter:off
+   Feign.Builder builder = get(context, Feign.Builder.class)
+         // required values
+         .logger(logger)
+         .encoder(get(context, Encoder.class))
+         .decoder(get(context, Decoder.class))
+         .contract(get(context, Contract.class));
+   // @formatter:on
+   configureFeign(context, builder);
+   applyBuildCustomizers(context, builder);
+
+   return builder;
+}
+```
+
+`Feign.Builder`顾名思义应该是构建FeignClient的构造器。从`FeignClientsConfiguration`中可以看出有两种Feign.Builder分别是
+
+```java
+//跟Hystrix相关
+@Bean
+@Scope("prototype")
+@ConditionalOnMissingBean
+@ConditionalOnProperty(name = "feign.hystrix.enabled")
+public Feign.Builder feignHystrixBuilder() {
+   return HystrixFeign.builder();
+}
+//跟重试相关
+	@Bean
+	@Scope("prototype")
+	@ConditionalOnMissingBean
+	public Feign.Builder feignBuilder(Retryer retryer) {
+		return Feign.builder().retryer(retryer);
+	}
+```
+
+另外在`FeignClientsConfiguration`中可以看到很多FeignClient相关的默认配置，比如Encode、Decode等等。
+
+从FeignContext中获取Encoder、Decoder、Contract之后，开始进入`configureFeign(context, builder)`方法根据配置信息配置Feign。
+
+```java
+protected void configureFeign(FeignContext context, Feign.Builder builder) {
+  //这里是从yaml文件中读取以feign.client开头的配置 
+  FeignClientProperties properties = beanFactory != null
+         ? beanFactory.getBean(FeignClientProperties.class)
+         : applicationContext.getBean(FeignClientProperties.class);
+		// 这里从FeignContext中获取FeignClientConfigurer配置
+   FeignClientConfigurer feignClientConfigurer = getOptional(context,
+         FeignClientConfigurer.class);
+   setInheritParentContext(feignClientConfigurer.inheritParentConfiguration());
+	 
+  //下面开始用这些配置装配Feign.Builder
+   if (properties != null && inheritParentContext) {
+      if (properties.isDefaultToProperties()) {
+         configureUsingConfiguration(context, builder);
+         configureUsingProperties(
+               properties.getConfig().get(properties.getDefaultConfig()),
+               builder);
+         configureUsingProperties(properties.getConfig().get(contextId), builder);
+      }
+      else {
+         configureUsingProperties(
+               properties.getConfig().get(properties.getDefaultConfig()),
+               builder);
+         configureUsingProperties(properties.getConfig().get(contextId), builder);
+         configureUsingConfiguration(context, builder);
+      }
+   } else {
+      configureUsingConfiguration(context, builder);
+   }
+}
+```
+
+上面加了一下注释，这里还是归纳一下
+
+- 首先从yaml文件中读取以feign.client开头的配置
+- 然后从FeignContext中获取FeignClientConfigurer的配置信息
+- 然后根据这些配置装配Feign.Builder，比如重试次数，超时时间，连接超时时间等等。
+
+上面装配完了之后就进入了`applyBuildCustomizers(context, builder)`方法，这个方法看名字就是实现Feign.Builder的一些定制化。
+
+```java
+private void applyBuildCustomizers(FeignContext context, Feign.Builder builder) {
+   Map<String, FeignBuilderCustomizer> customizerMap = context
+         .getInstances(contextId, FeignBuilderCustomizer.class);
+
+   if (customizerMap != null) {
+      customizerMap.values().stream()
+            .sorted(AnnotationAwareOrderComparator.INSTANCE)
+            .forEach(feignBuilderCustomizer -> feignBuilderCustomizer
+                  .customize(builder));
+   }
+   additionalCustomizers.forEach(customizer -> customizer.customize(builder));
+}
+```
+
+这里应该是提供给开发人员可以扩展的接口。
+
+全部完成后就完成了Feign.Builder的构建。
+
+#### 生成FeignClient的动态代理
+
+```java
+if (!StringUtils.hasText(url)) {
+   if (url != null && LOG.isWarnEnabled()) {
+      LOG.warn(
+            "The provided URL is empty. Will try picking an instance via load-balancing.");
+   }
+   else if (LOG.isDebugEnabled()) {
+      LOG.debug("URL not provided. Will use LoadBalancer.");
+   }
+   if (!name.startsWith("http")) {
+      url = "http://" + name;
+   }
+   else {
+      url = name;
+   }
+   url += cleanPath();
+   return (T) loadBalance(builder, context,
+         new HardCodedTarget<>(type, name, url));
+}
+```
+
+代码往下走，可以看到开始对url进行处理了，如果在`@FeignClient`中没有指定Url的话，那么这里的url应该为空，可以看到feign这里会对url进行处理，最终生成的url大概为http://service-provider ,这里就比较明显的能看出像是给Ribbon提供的url了，再结合下面的`return (T) loadBalance(builder, context,new HardCodedTarget<>(type, name, url))`应该会返回一个跟Ribbon相关的带有负载均衡的一个动态代理。看看这里的入参数：
+
+- Feign.builder
+- FeignContext
+- type我这里是cn.ld.cloud.service.RandomService 也就是`@FeignClient`注解的类的类型
+- Name 是`@FeignClient`注解中声明的名字，也就是你要调用的服务名称
+- url就是上面生成的url 为http://service-provider
+
+```java
+protected <T> T loadBalance(Feign.Builder builder, FeignContext context,
+      HardCodedTarget<T> target) {
+   Client client = getOptional(context, Client.class);
+   if (client != null) {
+      builder.client(client);
+      Targeter targeter = get(context, Targeter.class);
+      return targeter.target(this, builder, context, target);
+   }
+
+   throw new IllegalStateException(
+         "No Feign Client for loadBalancing defined. Did you forget to include spring-cloud-starter-netflix-ribbon or spring-cloud-starter-loadbalancer?");
+}
+```
+
+这段代码我在调试的时候
+
+- Client返回的是`LoadBalancerFeignClient`，这个又是啥呢？我找了一下源码发现这个类在`org.springframework.cloud.openfeign.ribbon`这个包下面，这个包下面应该就是Feign和Ribbon整合的相关代码了。这个包下面有这几个配置类
+
+  1. DefaultFeignLoadBalancedConfiguration(默认的就是返回的LoadBalancerFeignClient)
+  2. HttpClient5FeignLoadBalancedConfiguration（feign.httpclient.hc5.enabled = true）
+  3. HttpClientFeignLoadBalancedConfiguration(feign.httpclient.enabled = true)
+  4. OkHttpFeignLoadBalancedConfiguration(feign.okhttp.enabled = true)
+
+  上面的几个配置应该是在yaml文件中配置后，就会用不同的技术生成对应的Http Client
+
+- Targeter是`HystrixTargeter`
+
+`HystrixTargeter`是个啥呢？看代码,`HystrixTargeter`是定义在了`FeignAutoConfiguration`中
+
+```java
+@Configuration(proxyBeanMethods = false)
+@Conditional(FeignCircuitBreakerDisabledConditions.class)
+@ConditionalOnClass(name = "feign.hystrix.HystrixFeign")
+@ConditionalOnProperty(value = "feign.hystrix.enabled", havingValue = "true",
+      matchIfMissing = true) //看这里，默认就是他，没有也是true
+protected static class HystrixFeignTargeterConfiguration {
+   @Bean
+   @ConditionalOnMissingBean
+   public Targeter feignTargeter() {
+      return new HystrixTargeter();
+   }
+}
+```
+
+下面的代码是`HystrixTargeter#target`方法
+
+```java
+@Override
+public <T> T target(FeignClientFactoryBean factory, Feign.Builder feign,
+      FeignContext context, Target.HardCodedTarget<T> target) {
+   if (!(feign instanceof feign.hystrix.HystrixFeign.Builder)) {
+      return feign.target(target);
+   }
+   feign.hystrix.HystrixFeign.Builder builder = (feign.hystrix.HystrixFeign.Builder) feign;
+   String name = StringUtils.isEmpty(factory.getContextId()) ? factory.getName()
+         : factory.getContextId();
+   SetterFactory setterFactory = getOptional(name, context, SetterFactory.class);
+   if (setterFactory != null) {
+      builder.setterFactory(setterFactory);
+   }
+   Class<?> fallback = factory.getFallback();
+   if (fallback != void.class) {
+      return targetWithFallback(name, context, target, builder, fallback);
+   }
+   Class<?> fallbackFactory = factory.getFallbackFactory();
+   if (fallbackFactory != void.class) {
+      return targetWithFallbackFactory(name, context, target, builder,
+            fallbackFactory);
+   }
+
+   return feign.target(target);
+}
+```
+
+看最后的`feign.target(target)`方法，实际上就是生成了动态代理
+
+```java
+public <T> T target(Target<T> target) {
+  return build().newInstance(target);
+}
+```
 
