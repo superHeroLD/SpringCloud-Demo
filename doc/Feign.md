@@ -482,3 +482,107 @@ public <T> T target(Target<T> target) {
 }
 ```
 
+```java
+  public Feign build() {
+    Client client = Capability.enrich(this.client, capabilities);
+    Retryer retryer = Capability.enrich(this.retryer, capabilities);
+    List<RequestInterceptor> requestInterceptors = this.requestInterceptors.stream()
+        .map(ri -> Capability.enrich(ri, capabilities))
+        .collect(Collectors.toList());
+    Logger logger = Capability.enrich(this.logger, capabilities);
+    Contract contract = Capability.enrich(this.contract, capabilities);
+    Options options = Capability.enrich(this.options, capabilities);
+    Encoder encoder = Capability.enrich(this.encoder, capabilities);
+    Decoder decoder = Capability.enrich(this.decoder, capabilities);
+    InvocationHandlerFactory invocationHandlerFactory =
+        Capability.enrich(this.invocationHandlerFactory, capabilities);
+    QueryMapEncoder queryMapEncoder = Capability.enrich(this.queryMapEncoder, capabilities);
+		
+    //这里是为了@FeignClient注解中的每个方法都生成了一个对应的处理方法
+    SynchronousMethodHandler.Factory synchronousMethodHandlerFactory =
+        new SynchronousMethodHandler.Factory(client, retryer, requestInterceptors, logger,
+            logLevel, decode404, closeAfterDecode, propagationPolicy, forceDecoding);
+    //这里是将方法名称和对应的处理方法相关联
+    ParseHandlersByName handlersByName =
+        new ParseHandlersByName(contract, options, encoder, decoder, queryMapEncoder,
+            errorDecoder, synchronousMethodHandlerFactory);
+    //生成动态代理
+    return new ReflectiveFeign(handlersByName, invocationHandlerFactory, queryMapEncoder);
+  }
+}
+```
+
+到builder方法主要是为了生存动态代理做一些准备工作
+
+- 根据配置生成针对每个方法的处理方法
+- 将方法名称与处理方法相关联
+- 调用`ReflectiveFeign`准备生成动态代理
+
+接着调用`ReflectiveFeign#newInstance()`方法
+
+```java
+public <T> T newInstance(Target<T> target) {
+  Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
+  Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
+  List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
+
+  for (Method method : target.type().getMethods()) {
+    if (method.getDeclaringClass() == Object.class) {
+      continue;
+    } else if (Util.isDefault(method)) {
+      DefaultMethodHandler handler = new DefaultMethodHandler(method);
+      defaultMethodHandlers.add(handler);
+      methodToHandler.put(method, handler);
+    } else {
+      methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
+    }
+  }
+  //这里生成了动态代理的处理方法
+  InvocationHandler handler = factory.create(target, methodToHandler);
+  //这里生成了动态代理
+  T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(),
+      new Class<?>[] {target.type()}, handler);
+
+  for (DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
+    defaultMethodHandler.bindTo(proxy);
+  }
+  return proxy;
+}
+```
+
+在这个方法中就最终生成了动态代理，这里记录一下这段代码的关键点：
+
+- InvocationHandler handler = factory.create(target, methodToHandler)这段代码生成的InvocationHandler是`FeignInvocationHandler`，代码如下
+
+  ```java
+  static class FeignInvocationHandler implements InvocationHandler {
+  
+    private final Target target;
+    private final Map<Method, MethodHandler> dispatch;
+  
+    FeignInvocationHandler(Target target, Map<Method, MethodHandler> dispatch) {
+      this.target = checkNotNull(target, "target");
+      this.dispatch = checkNotNull(dispatch, "dispatch for %s", target);
+    }
+  
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      if ("equals".equals(method.getName())) {
+        try {
+          Object otherHandler =
+              args.length > 0 && args[0] != null ? Proxy.getInvocationHandler(args[0]) : null;
+          return equals(otherHandler);
+        } catch (IllegalArgumentException e) {
+          return false;
+        }
+      } else if ("hashCode".equals(method.getName())) {
+        return hashCode();
+      } else if ("toString".equals(method.getName())) {
+        return toString();
+      }
+  
+      return dispatch.get(method).invoke(args);
+    }
+  ```
+
+- MethodHandler是`SynchronousMethodHandler`Feign处理请求最终调用的就是`SynchronousMethodHandler#invoke()`方法
