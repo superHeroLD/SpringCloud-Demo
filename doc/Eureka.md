@@ -473,7 +473,7 @@ Eureka中的缓存结构，`ResponseCache`，响应缓存**接口**，其实现�
 
 **被动过期读写缓存**
 
-读写缓存( `readWriteCacheMap` ) 写入后，一段时间自动过期，实现代码如下：
+读写缓存( `readWriteCacheMap` ) 写入后因为使用guava cache实现的所以可以一段时间自动过期，实现代码如下：
 
 ```
 expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds())
@@ -540,7 +540,7 @@ Eureka-Client 将**变化**的应用集合和**本地缓存**的应用集合进�
 调用 `DiscoveryClient#getAndUpdateDelta(...)` 方法，**增量**获取注册信息，并**刷新**本地缓存。代码逻辑如下：
 
 - 请求增量获取注册信息，调用 `AbstractJerseyEurekaHttpClient#getApplicationsInternal(...)` 方法，GET 请求 Eureka-Server 的 `apps/detla` 接口，参数为 `regions` ，返回格式为 JSON ，实现增量获取注册信息。
-- 如果增量获取失败，那么就全量获取注册信息，并设置到北店缓存。
+- 如果增量获取失败，那么就全量获取注册信息，并设置到本地缓存。
 - 处理增量获取结果
   - `#updateDelta(...)` 方法，将**变化**的应用集合和本地缓存的应用集合进行合并。
   - 判断一致性哈希值，调用 `#reconcileAndLogDifference()` 方法，全量获取注册信息，并设置到本地缓存，和 `#getAndStoreFullRegistry()` 基本类似。
@@ -632,7 +632,286 @@ public void cancel() {
 - 设置应用实例信息的操作类型为添加，并添加到最近租约变更记录队列( `recentlyChangedQueue` )。`recentlyChangedQueue` 用于注册信息的增量获取
 - 设置响应缓存( ResponseCache )过期，`invalidateCache(appName, vip, svip)`这个方法比较重要。
 
-### Eureka自我保护机制
+### Eureka启动与其他节点同步注册信息
+
+在`EurekaBootStrap#initEurekaServerContext()`在服务启动时会与别的Eureka节点进行注册信息同步，从别的Eureka节点同步注册信息。
+
+```java
+// Copy registry from neighboring eureka node
+int registryCount = registry.syncUp();
+```
+
+```java
+@Override
+public int syncUp() {
+    // Copy entire entry from neighboring DS node
+    int count = 0;
+
+    for (int i = 0; ((i < serverConfig.getRegistrySyncRetries()) && (count == 0)); i++) {
+        if (i > 0) {
+            try {
+                Thread.sleep(serverConfig.getRegistrySyncRetryWaitMs());
+            } catch (InterruptedException e) {
+                logger.warn("Interrupted during registry transfer..");
+                break;
+            }
+        }
+        Applications apps = eurekaClient.getApplications();
+        for (Application app : apps.getRegisteredApplications()) {
+            for (InstanceInfo instance : app.getInstances()) {
+                try {
+                    if (isRegisterable(instance)) {
+                        register(instance, instance.getLeaseInfo().getDurationInSecs(), true);
+                        count++;
+                    }
+                } catch (Throwable t) {
+                    logger.error("During DS init copy", t);
+                }
+            }
+        }
+    }
+    return count;
+}
+```
+
+Eureka在启动的时候会进行注册信息同步，一般只会同步一个节点，因为count肯定不是0了。整个逻辑如下：
+
+- 根据配置判断是否可以进行同步(numberRegistrySyncRetries 5)并且之前没有进行过同步
+- 如果i > 0 也就是执行过同步了，那么就等待一下在进行同步(registrySyncRetryWaitMs 30 * 1000 ) 30S
+- 随后通过Eureka-client从相邻节点同步应用信息
+- 然后遍历应用信息看是否需要注册，如果需要注册就通过`register`方法注册到本地缓存中
+
+```java
+public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {
+    read.lock();
+    try {
+        Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());
+        REGISTER.increment(isReplication);
+        if (gMap == null) {
+            final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();
+            gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);
+            if (gMap == null) {
+                gMap = gNewMap;
+            }
+        }
+        Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());
+        // Retain the last dirty timestamp without overwriting it, if there is already a lease
+        if (existingLease != null && (existingLease.getHolder() != null)) {
+            Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();
+            Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();
+            logger.debug("Existing lease found (existing={}, provided={}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+
+            // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted
+            // InstanceInfo instead of the server local copy.
+            if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {
+                logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +
+                        " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
+                logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");
+                registrant = existingLease.getHolder();
+            }
+        } else {
+            // The lease does not exist and hence it is a new registration
+            synchronized (lock) {
+                if (this.expectedNumberOfClientsSendingRenews > 0) {
+                    // Since the client wants to register it, increase the number of clients sending renews
+                    this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;
+                  //这里更新了一下自我保护的阈值  
+                  updateRenewsPerMinThreshold();
+                }
+            }
+            logger.debug("No previous lease information found; it is new registration");
+        }
+      //生成租约信息
+        Lease<InstanceInfo> lease = new Lease<InstanceInfo>(registrant, leaseDuration);
+        if (existingLease != null) {
+            lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
+        }
+      //把注册信息放到缓存中
+        gMap.put(registrant.getId(), lease);
+      //加入到最近注册的Queue中
+        recentRegisteredQueue.add(new Pair<Long, String>(
+                System.currentTimeMillis(),
+                registrant.getAppName() + "(" + registrant.getId() + ")"));
+        // This is where the initial state transfer of overridden status happens
+        if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
+            logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
+                            + "overrides", registrant.getOverriddenStatus(), registrant.getId());
+            if (!overriddenInstanceStatusMap.containsKey(registrant.getId())) {
+                logger.info("Not found overridden id {} and hence adding it", registrant.getId());
+                overriddenInstanceStatusMap.put(registrant.getId(), registrant.getOverriddenStatus());
+            }
+        }
+        InstanceStatus overriddenStatusFromMap = overriddenInstanceStatusMap.get(registrant.getId());
+        if (overriddenStatusFromMap != null) {
+            logger.info("Storing overridden status {} from map", overriddenStatusFromMap);
+            registrant.setOverriddenStatus(overriddenStatusFromMap);
+        }
+
+        // Set the status based on the overridden status rules
+        InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);
+        registrant.setStatusWithoutDirty(overriddenInstanceStatus);
+
+        // If the lease is registered with UP status, set lease service up timestamp
+        if (InstanceStatus.UP.equals(registrant.getStatus())) {
+            lease.serviceUp();
+        }
+        registrant.setActionType(ActionType.ADDED);
+      //放到最近变化的Queue中
+        recentlyChangedQueue.add(new RecentlyChangedItem(lease));
+      //更改了最近注册的时间戳
+        registrant.setLastUpdatedTimestamp();
+      //过期自己的readWriteCacheMap
+        invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
+        logger.info("Registered instance {}/{} with status {} (replication={})",
+                registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);
+    } finally {
+        read.unlock();
+    }
+}
+```
+
+具体逻辑看代码注释吧，不写了
+
+### Eureka启动注册信息扫描过期任务和自动保护机制
+
+```java
+registry.openForTraffic(applicationInfoManager, registryCount);
+```
+
+不得不说Eureka这方法命名真的厉害，这特么openForTraffic什么鬼？
+
+```java
+@Override
+public void openForTraffic(ApplicationInfoManager applicationInfoManager, int count) {
+    // Renewals happen every 30 seconds and for a minute it should be a factor of 2.
+    this.expectedNumberOfClientsSendingRenews = count;
+  //首先更新了一下自我保护的一个阈值
+    updateRenewsPerMinThreshold();
+    logger.info("Got {} instances from neighboring DS node", count);
+    logger.info("Renew threshold is: {}", numberOfRenewsPerMinThreshold);
+    this.startupTime = System.currentTimeMillis();
+    if (count > 0) {
+        this.peerInstancesTransferEmptyOnStartup = false;
+    }
+    DataCenterInfo.Name selfName = applicationInfoManager.getInfo().getDataCenterInfo().getName();
+  //处理一下AWS相关的逻辑，不细看了
+    boolean isAws = Name.Amazon == selfName;
+    if (isAws && serverConfig.shouldPrimeAwsReplicaConnections()) {
+        logger.info("Priming AWS connections for all replicas..");
+        primeAwsReplicas(applicationInfoManager);
+    }
+    logger.info("Changing status to UP");
+  //给自己的服务实例信息变更为UP，让别人可以看到
+    applicationInfoManager.setInstanceStatus(InstanceStatus.UP);
+  //最主要的方法，这里面启动了一个扫描过期注册信息的任务
+    super.postInit();
+}
+```
+
+```java
+protected void postInit() {
+    renewsLastMin.start();
+    if (evictionTaskRef.get() != null) {
+        evictionTaskRef.get().cancel();
+    }
+    evictionTaskRef.set(new EvictionTask());
+    evictionTimer.schedule(evictionTaskRef.get(),
+            serverConfig.getEvictionIntervalTimerInMs(),
+            serverConfig.getEvictionIntervalTimerInMs());
+}
+```
+
+这里就是`openForTraffic`这个方法的执行重点了，其实就是启动了一个`new EvictionTask()`任务，并且延时60S执行，每60S执行一次。
+
+```java
+@Override
+public void run() {
+    try {
+      //计算了一个补偿时间
+        long compensationTimeMs = getCompensationTimeMs();
+        logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);
+        evict(compensationTimeMs);
+    } catch (Throwable e) {
+        logger.error("Could not run the evict task", e);
+    }
+}
+
+/**
+ * compute a compensation time defined as the actual time this task was executed since the prev iteration,
+ * vs the configured amount of time for execution. This is useful for cases where changes in time (due to
+ * clock skew or gc for example) causes the actual eviction task to execute later than the desired time
+ * according to the configured cycle.
+ */
+long getCompensationTimeMs() {
+    long currNanos = getCurrentTimeNano();
+    long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);
+    if (lastNanos == 0l) {
+        return 0l;
+    }
+
+    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(currNanos - lastNanos);
+    long compensationTime = elapsedMs - serverConfig.getEvictionIntervalTimerInMs();
+    return compensationTime <= 0l ? 0l : compensationTime;
+}
+```
+
+在`EvictionTask()`任务中，首先计算了一个补偿时间，这个补偿时间的意思是服务由于Linux时钟偏移了或者GC停顿了导致程序计算过期服务时间的间隔变短了，比如30S执行一次，这时候GC停顿了15S，然后网络拥堵了15S，可能Eureka本身都还没有进行心跳检测，所以这时候把一些服务给判定为下线了是不合理的，这里就是计算一下补偿时间。把这部分时间考虑进去。然后带着补偿时间的`run()`方法执行了下面的方法。
+
+```java
+public void evict(long additionalLeaseMs) {
+    logger.debug("Running the evict task");
+		
+  //判断是否是自我保护模式，如果是的话就不过期了，自我保护的详细代码写在下面了
+    if (!isLeaseExpirationEnabled()) {
+        logger.debug("DS: lease expiration is currently disabled.");
+        return;
+    }
+		
+  //这里就是说先把所有过期的注册信息都给取出来，
+    // We collect first all expired items, to evict them in random order. For large eviction sets,
+    // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,
+    // the impact should be evenly distributed across all applications.
+    List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();
+    for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {
+        Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();
+        if (leaseMap != null) {
+            for (Entry<String, Lease<InstanceInfo>> leaseEntry : leaseMap.entrySet()) {
+                Lease<InstanceInfo> lease = leaseEntry.getValue();
+                if (lease.isExpired(additionalLeaseMs) && lease.getHolder() != null) {
+                    expiredLeases.add(lease);
+                }
+            }
+        }
+    }
+
+    // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
+    // triggering self-preservation. Without that we would wipe out full registry.
+    int registrySize = (int) getLocalRegistrySize();
+    int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
+    int evictionLimit = registrySize - registrySizeThreshold;
+
+    int toEvict = Math.min(expiredLeases.size(), evictionLimit);
+    if (toEvict > 0) {
+        logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
+
+        Random random = new Random(System.currentTimeMillis());
+        for (int i = 0; i < toEvict; i++) {
+            // Pick a random item (Knuth shuffle algorithm)
+            int next = i + random.nextInt(expiredLeases.size() - i);
+            Collections.swap(expiredLeases, i, next);
+            Lease<InstanceInfo> lease = expiredLeases.get(i);
+
+            String appName = lease.getHolder().getAppName();
+            String id = lease.getHolder().getId();
+            EXPIRED.increment();
+            logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
+            internalCancel(appName, id, false);
+        }
+    }
+}
+```
+
+#### Eureka自我保护机制
 
 自我保护机制定义如下：
 
@@ -643,6 +922,36 @@ public void cancel() {
 > 综上，自我保护模式是一种应对网络异常的安全保护措施。它的架构哲学是宁可同时保留所有微服务（健康的微服务和不健康的微服务都会保留），也不盲目注销任何健康的微服务。使用自我保护模式，可以让Eureka集群更加的健壮、稳定。
 >
 > 在Spring Cloud中，可以使用`eureka.server.enable-self-preservation = false` 禁用自我保护模式。
+
+```java
+@Override
+public boolean isLeaseExpirationEnabled() {
+    if (!isSelfPreservationModeEnabled()) {
+        // The self preservation mode is disabled, hence allowing the instances to expire.
+        return true;
+    }
+    return numberOfRenewsPerMinThreshold > 0 && getNumOfRenewsInLastMin() > numberOfRenewsPerMinThreshold;
+}
+```
+
+```java
+protected void updateRenewsPerMinThreshold() {
+    this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews
+            * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())
+            * serverConfig.getRenewalPercentThreshold());
+}
+```
+
+```java
+@Override
+public long getNumOfRenewsInLastMin() {
+    return renewsLastMin.getCount();
+}
+```
+
+上面是有关自我保护的两段代码，首先`numberOfRenewsPerMinThreshold`就是每分钟期望的心跳数量，翻译一下计算逻辑就是Eureka中注册的实例数量 * 每分钟2次心跳 * 0.85的阈值就是这个数。
+
+是否开启自动保护机制的逻辑就是用上一分钟接收到的心跳数量`getNumOfRenewsInLastMin()`与期望的每分钟接收到的心跳数量做比较`numberOfRenewsPerMinThreshold`。如果没收到，那么就会认为我Eureka自己本身除了问题，那么我就不下线实例了。
 
 ### Eureka批任务处理
 
