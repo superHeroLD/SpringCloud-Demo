@@ -1049,6 +1049,7 @@ Eureka-Server 集群通过任务批处理同步应用实例注册实例。
   ### Eureka-Server集群同步
 
 - Eureka-Server 集群不区分**主从节点**或者 **Primary & Secondary 节点**，所有节点**相同角色( 也就是没有角色 )，完全对等**。
+
 - Eureka-Client 可以向**任意** Eureka-Client 发起任意**读写**操作，Eureka-Server 将操作复制到另外的 Eureka-Server 以达到**最终一致性**。注意，Eureka-Server 是选择了 AP 的组件。
 
 在`EurekaBootStrap#initEurekaServerContext()`方法中,构建了`PeerEurekaNodes`这里面就是同步Eureka-Server集群信息。
@@ -1241,3 +1242,280 @@ PeerEurekaNode(PeerAwareInstanceRegistry registry, String targetHost, String ser
 
 - Eureka-Server 接收到 Eureka-Client 的 Register、Heartbeat、Cancel、StatusUpdate、DeleteStatusOverride 操作，固定间隔( 默认值 ：500 毫秒，可配 )向 Eureka-Server 集群内其他节点同步( **准实时，非实时** )。
 
+集群同步注册信息的方式是`PeerAwareInstanceRegistryImpl#replicateToPeers()`方法，这个方法的调用分别在
+
+- `PeerAwareInstanceRegistryImpl#cancel()`下线
+- `PeerAwareInstanceRegistryImpl#register()`注册
+- `PeerAwareInstanceRegistryImpl#renew()`心跳
+- `PeerAwareInstanceRegistryImpl#statusUpdate()`状态更新
+- `PeerAwareInstanceRegistryImpl#deleteStatusOverride()`这我都不知道是干嘛的
+
+```java
+private void replicateToPeers(Action action, String appName, String id,
+                              InstanceInfo info /* optional */,
+                              InstanceStatus newStatus /* optional */, boolean isReplication) {
+    Stopwatch tracer = action.getTimer().start();
+    try {
+      //增加一个统计
+        if (isReplication) {
+            numberOfReplicationsLastMin.increment();
+        }
+      //看是否是同步，如果是同步就不给自己同步了
+        // If it is a replication already, do not replicate again as this will create a poison replication
+        if (peerEurekaNodes == Collections.EMPTY_LIST || isReplication) {
+            return;
+        }
+			
+     //遍历每个同步节点PeerEurekaNode，向每个节点同步变化信息
+        for (final PeerEurekaNode node : peerEurekaNodes.getPeerEurekaNodes()) {
+            // If the url represents this host, do not replicate to yourself.
+            if (peerEurekaNodes.isThisMyUrl(node.getServiceUrl())) {
+                continue;
+            }
+          //执行同步任务，详情见下面的源码
+            replicateInstanceActionsToPeers(action, appName, id, info, newStatus, node);
+        }
+    } finally {
+        tracer.stop();
+    }
+}
+```
+
+```java
+private void replicateInstanceActionsToPeers(Action action, String appName,
+                                             String id, InstanceInfo info, InstanceStatus newStatus,
+                                             PeerEurekaNode node) {
+    try {
+        InstanceInfo infoFromRegistry;
+        CurrentRequestVersion.set(Version.V2);
+      //根据不同的action执行不同的逻辑，具体都干嘛了呢，其实就是创建了一个相对应的批量任务扔到队列里去执行
+        switch (action) {
+            case Cancel:
+                node.cancel(appName, id);
+                break;
+            case Heartbeat:
+                InstanceStatus overriddenStatus = overriddenInstanceStatusMap.get(id);
+                infoFromRegistry = getInstanceByAppAndId(appName, id, false);
+                node.heartbeat(appName, id, infoFromRegistry, overriddenStatus, false);
+                break;
+            case Register:
+                node.register(info);
+                break;
+            case StatusUpdate:
+                infoFromRegistry = getInstanceByAppAndId(appName, id, false);
+                node.statusUpdate(appName, id, newStatus, infoFromRegistry);
+                break;
+            case DeleteStatusOverride:
+                infoFromRegistry = getInstanceByAppAndId(appName, id, false);
+                node.deleteStatusOverride(appName, id, infoFromRegistry);
+                break;
+        }
+    } catch (Throwable t) {
+        logger.error("Cannot replicate information to {} for action {}", node.getServiceUrl(), action.name(), t);
+    } finally {
+        CurrentRequestVersion.remove();
+    }
+}
+```
+
+随便找一个以Cancel为例
+
+```java
+public void cancel(final String appName, final String id) throws Exception {
+    long expiryTime = System.currentTimeMillis() + maxProcessingDelayMs;
+    batchingDispatcher.process(
+            taskId("cancel", appName, id),
+      //注意这里实现了InstanceReplicationTask的execute方法
+            new InstanceReplicationTask(targetHost, Action.Cancel, appName, id) {
+                @Override
+                public EurekaHttpResponse<Void> execute() {
+                  //执行具体操作
+                    return replicationClient.cancel(appName, id);
+                }
+
+                @Override
+                public void handleFailure(int statusCode, Object responseEntity) throws Throwable {
+                    super.handleFailure(statusCode, responseEntity);
+                    if (statusCode == 404) {
+                        logger.warn("{}: missing entry.", getTaskName());
+                    }
+                }
+            },
+            expiryTime
+    );
+}
+```
+
+所有的任务都实现了`InstanceReplicationTask#execute`方法，里面写了具体的操作，比如Cancel就是调用Eureka-Client执行了cancel逻辑。`batchingDispatcher.process`最终就会把任务扔到acceptorQueue任务队列里去
+
+```java
+void process(ID id, T task, long expiryTime) {
+    acceptorQueue.add(new TaskHolder<ID, T>(id, task, expiryTime));
+    acceptedTasks++;
+}
+```
+
+批量任务的处理逻辑在`ReplicationTaskProcessor#process()`方法中
+
+```java
+@Override
+public ProcessingResult process(List<ReplicationTask> tasks) {
+    ReplicationList list = createReplicationListOf(tasks);
+    try {
+      //其实就是调用了一个批量提交任务的app
+        EurekaHttpResponse<ReplicationListResponse> response = replicationClient.submitBatchUpdates(list);
+        int statusCode = response.getStatusCode();
+        if (!isSuccess(statusCode)) {
+            if (statusCode == 503) {
+                logger.warn("Server busy (503) HTTP status code received from the peer {}; rescheduling tasks after delay", peerId);
+                return ProcessingResult.Congestion;
+            } else {
+                // Unexpected error returned from the server. This should ideally never happen.
+                logger.error("Batch update failure with HTTP status code {}; discarding {} replication tasks", statusCode, tasks.size());
+                return ProcessingResult.PermanentError;
+            }
+        } else {
+          //批量处理批量请求
+            handleBatchResponse(tasks, response.getEntity().getResponseList());
+        }
+    } catch (Throwable e) {
+      ...省略一些异常代码
+    }
+    return ProcessingResult.Success;
+}
+```
+
+### 批量处理同步任务
+
+Eureka-Server处理批量同步任务的逻辑在`PeerReplicationResource#batchReplication()`方法中
+
+```java
+@Path("batch")
+@POST
+public Response batchReplication(ReplicationList replicationList) {
+    try {
+        ReplicationListResponse batchResponse = new ReplicationListResponse();
+        for (ReplicationInstance instanceInfo : replicationList.getReplicationList()) {
+            try {
+              //逐个同步任务依次处理并将结果放到ReplicationListResponse中
+                batchResponse.addResponse(dispatch(instanceInfo));
+            } catch (Exception e) {
+                batchResponse.addResponse(new ReplicationInstanceResponse(Status.INTERNAL_SERVER_ERROR.getStatusCode(), null));
+                logger.error("{} request processing failed for batch item {}/{}",
+                        instanceInfo.getAction(), instanceInfo.getAppName(), instanceInfo.getId(), e);
+            }
+        }
+        return Response.ok(batchResponse).build();
+    } catch (Throwable e) {
+        logger.error("Cannot execute batch Request", e);
+        return Response.status(Status.INTERNAL_SERVER_ERROR).build();
+    }
+}
+
+private ReplicationInstanceResponse dispatch(ReplicationInstance instanceInfo) {
+    ApplicationResource applicationResource = createApplicationResource(instanceInfo);
+    InstanceResource resource = createInstanceResource(instanceInfo, applicationResource);
+
+    String lastDirtyTimestamp = toString(instanceInfo.getLastDirtyTimestamp());
+    String overriddenStatus = toString(instanceInfo.getOverriddenStatus());
+    String instanceStatus = toString(instanceInfo.getStatus());
+
+    Builder singleResponseBuilder = new Builder();
+  //依次处理每种任务类型，具体的处理逻辑就是我们之前看到的各种方法
+    switch (instanceInfo.getAction()) {
+        case Register:
+            singleResponseBuilder = handleRegister(instanceInfo, applicationResource);
+            break;
+        case Heartbeat:
+            singleResponseBuilder = handleHeartbeat(serverConfig, resource, lastDirtyTimestamp, overriddenStatus, instanceStatus);
+            break;
+        case Cancel:
+            singleResponseBuilder = handleCancel(resource);
+            break;
+        case StatusUpdate:
+            singleResponseBuilder = handleStatusUpdate(instanceInfo, resource);
+            break;
+        case DeleteStatusOverride:
+            singleResponseBuilder = handleDeleteStatusOverride(instanceInfo, resource);
+            break;
+    }
+    return singleResponseBuilder.build();
+}
+```
+
+`dispatch`中负责处理不同类型的任务，以Register任务为例，最终底层调用了`ApplicationResource#addInstance`方法。
+
+当批量任务都处理完之后，会把处理结果返回给发送方，发送方收到结果后会在`ReplicationTaskProcessor#process()`中进行处理。具体的处理逻辑在`ReplicationTaskProcessor#handleBatchResponse`方法中
+
+```java
+private void handleBatchResponse(List<ReplicationTask> tasks, List<ReplicationInstanceResponse> responseList) {
+    if (tasks.size() != responseList.size()) {
+        // This should ideally never happen unless there is a bug in the software.
+        logger.error("Batch response size different from submitted task list ({} != {}); skipping response analysis", responseList.size(), tasks.size());
+        return;
+    }
+    for (int i = 0; i < tasks.size(); i++) {
+        handleBatchResponse(tasks.get(i), responseList.get(i));
+    }
+}
+
+private void handleBatchResponse(ReplicationTask task, ReplicationInstanceResponse response) {
+    int statusCode = response.getStatusCode();
+  //处理成功情况  
+  if (isSuccess(statusCode)) {
+        task.handleSuccess();
+        return;
+    }
+  //处理失败情况
+    try {
+        task.handleFailure(response.getStatusCode(), response.getResponseEntity());
+    } catch (Throwable e) {
+        logger.error("Replication task {} error handler failure", task.getTaskName(), e);
+    }
+}
+```
+
+下面引入一段我觉得比较好的对于Eureka集群同步的分析
+
+> 本文的重要头戏来啦！Last But Very Importment ！！！
+>
+> Eureka-Server 是允许**同一时刻**允许在任意节点被 Eureka-Client 发起**写入**相关的操作，网络是不可靠的资源，Eureka-Client 可能向一个 Eureka-Server 注册成功，但是网络波动，导致 Eureka-Client 误以为失败，此时恰好 Eureka-Client 变更了应用实例的状态，重试向另一个 Eureka-Server 注册，那么两个 Eureka-Server 对该应用实例的状态产生冲突。
+>
+> 再例如…… 我们不要继续举例子，网络波动真的很复杂。我们来看看 Eureka 是怎么处理的。
+>
+> 应用实例( InstanceInfo ) 的 `lastDirtyTimestamp` 属性，使用**时间戳**，表示应用实例的**版本号**，当请求方( 不仅仅是 Eureka-Client ，也可能是同步注册操作的 Eureka-Server ) 向 Eureka-Server 发起注册时，若 Eureka-Server 已存在拥有更大 `lastDirtyTimestamp` 该实例( **相同应用并且相同应用实例编号被认为是相同实例** )，则请求方注册的应用实例( InstanceInfo ) 无法覆盖注册此 Eureka-Server 的该实例( 见 `AbstractInstanceRegistry#register(...)` 方法 )。例如我们上面举的例子，第一个 Eureka-Server 向 第二个 Eureka-Server 同步注册应用实例时，不会注册覆盖，反倒是第二个 Eureka-Server 同步注册应用到第一个 Eureka-Server ，注册覆盖成功，因为 `lastDirtyTimestamp` ( 应用实例状态变更时，可以设置 `lastDirtyTimestamp` 为当前时间，见 `ApplicationInfoManager#setInstanceStatus(status)` 方法 )。
+>
+> 但是光靠**注册**请求判断 `lastDirtyTimestamp` 显然是不够的，因为网络异常情况下时，同步操作任务多次执行失败到达过期时间后，此时在 Eureka-Server 集群同步起到最终一致性**最最最**关键性出现了：Heartbeat 。因为 Heartbeat 会周期性的执行，通过它一方面可以判断 Eureka-Server 是否存在心跳对应的应用实例，另外一方面可以比较应用实例的 `lastDirtyTimestamp` 。当满足下面任意条件，Eureka-Server 返回 404 状态码：
+>
+> - 1）Eureka-Server 应用实例不存在，点击 [链接](https://github.com/YunaiV/eureka/blob/69993ad1e80d45c43ac8585921eca4efb88b09b9/eureka-core/src/main/java/com/netflix/eureka/registry/AbstractInstanceRegistry.java#L438) 查看触发条件代码位置。
+> - 2）Eureka-Server 应用实例状态为 `UNKNOWN`，点击 [链接](https://github.com/YunaiV/eureka/blob/69993ad1e80d45c43ac8585921eca4efb88b09b9/eureka-core/src/main/java/com/netflix/eureka/registry/AbstractInstanceRegistry.java#L450) 查看触发条件代码位置。为什么会是 `UNKNOWN` ，在 [《Eureka 源码解析 —— 应用实例注册发现（八）之覆盖状态》「 4.3 续租场景」](http://www.iocoder.cn/Eureka/instance-registry-override-status/?self) 有详细解析。
+> - **3）**请求的 `lastDirtyTimestamp` 更大，点击 [链接](https://github.com/YunaiV/eureka/blob/69993ad1e80d45c43ac8585921eca4efb88b09b9/eureka-core/src/main/java/com/netflix/eureka/resources/InstanceResource.java#L306) 查看触发条件代码位置。
+>
+> 请求方接收到 404 状态码返回后，**认为 Eureka-Server 应用实例实际是不存在的**，重新发起应用实例的注册。以本文的 Heartbeat 为例子，代码如下：
+>
+> ```
+> // PeerEurekaNode#heartbeat(...)
+>   1: @Override
+>   2: public void handleFailure(int statusCode, Object responseEntity) throws Throwable {
+>   3:     super.handleFailure(statusCode, responseEntity);
+>   4:     if (statusCode == 404) {
+>   5:         logger.warn("{}: missing entry.", getTaskName());
+>   6:         if (info != null) {
+>   7:             logger.warn("{}: cannot find instance id {} and hence replicating the instance with status {}",
+>   8:                     getTaskName(), info.getId(), info.getStatus());
+>   9:             register(info);
+>  10:         }
+>  11:     } else if (config.shouldSyncWhenTimestampDiffers()) {
+>  12:         InstanceInfo peerInstanceInfo = (InstanceInfo) responseEntity;
+>  13:         if (peerInstanceInfo != null) {
+>  14:             syncInstancesIfTimestampDiffers(appName, id, info, peerInstanceInfo);
+>  15:         }
+>  16:     }
+>  17: }
+> ```
+>
+> - 第 4 至 10 行 ：接收到 404 状态码，调用 `#register(...)` 方法，向该被心跳同步操作失败的 Eureka-Server 发起注册**本地的应用实例**的请求。
+>   - 上述 **3）** ，会使用请求参数 `overriddenStatus` 存储到 Eureka-Server 的应用实例覆盖状态集合( `AbstractInstanceRegistry.overriddenInstanceStatusMap` )，点击 [链接](https://github.com/YunaiV/eureka/blob/69993ad1e80d45c43ac8585921eca4efb88b09b9/eureka-core/src/main/java/com/netflix/eureka/resources/InstanceResource.java#L123) 查看触发条件代码位置。
+> - 第 11 至 16 行 ：恰好是 **3）** 反过来的情况，本地的应用实例的 `lastDirtyTimestamp` 小于 Eureka-Server 该应用实例的，此时 Eureka-Server 返回 409 状态码，点击 [链接](https://github.com/YunaiV/eureka/blob/69993ad1e80d45c43ac8585921eca4efb88b09b9/eureka-core/src/main/java/com/netflix/eureka/resources/InstanceResource.java#L314) 查看触发条件代码位置。调用 `#syncInstancesIfTimestampDiffers()` 方法，覆盖注册本地应用实例，点击 [链接](https://github.com/YunaiV/eureka/blob/7f868f9ca715a8862c0c10cac04e238bbf371db0/eureka-core/src/main/java/com/netflix/eureka/cluster/PeerEurekaNode.java#L387) 查看方法。
+>
+> OK，撒花！记住：Eureka 通过 Heartbeat 实现 Eureka-Server 集群同步的最终一致性。
