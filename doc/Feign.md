@@ -522,6 +522,7 @@ public <T> T target(Target<T> target) {
 
 ```java
 public <T> T newInstance(Target<T> target) {
+  //针对每个方法生成对应的SynchronousMethodHandler
   Map<String, MethodHandler> nameToHandler = targetToHandlersByName.apply(target);
   Map<Method, MethodHandler> methodToHandler = new LinkedHashMap<Method, MethodHandler>();
   List<DefaultMethodHandler> defaultMethodHandlers = new LinkedList<DefaultMethodHandler>();
@@ -534,10 +535,11 @@ public <T> T newInstance(Target<T> target) {
       defaultMethodHandlers.add(handler);
       methodToHandler.put(method, handler);
     } else {
+      //这里转换了一下对应关系把在上面生成的SynchronousMethodHandler和方法method对应起来
       methodToHandler.put(method, nameToHandler.get(Feign.configKey(target.type(), method)));
     }
   }
-  //这里生成了动态代理的处理方法
+  //这里生成了动态代理的处理方法FeignInvocationHandler
   InvocationHandler handler = factory.create(target, methodToHandler);
   //这里生成了动态代理
   T proxy = (T) Proxy.newProxyInstance(target.type().getClassLoader(),
@@ -546,11 +548,53 @@ public <T> T newInstance(Target<T> target) {
   for (DefaultMethodHandler defaultMethodHandler : defaultMethodHandlers) {
     defaultMethodHandler.bindTo(proxy);
   }
+  //直接返回动态代理
   return proxy;
 }
 ```
 
-在这个方法中就最终生成了动态代理，这里记录一下这段代码的关键点：
+这里重点看一下`targetToHandlersByName.apply`方法的逻辑，apply方法生成了`@FeignClient`接口下每个方法对应的处理Handler
+
+```java
+  public Map<String, MethodHandler> apply(Target target) {
+    //这里使用了SpringMVCContract处理了一下，解析出一下源数据信息，并且处理了一下SpringMVC中的RequestMapping标签
+    List<MethodMetadata> metadata = contract.parseAndValidateMetadata(target.type());
+    Map<String, MethodHandler> result = new LinkedHashMap<String, MethodHandler>();
+    for (MethodMetadata md : metadata) {
+      BuildTemplateByResolvingArgs buildTemplate;
+      if (!md.formParams().isEmpty() && md.template().bodyTemplate() == null) {
+        buildTemplate =
+            new BuildFormEncodedTemplateFromArgs(md, encoder, queryMapEncoder, target);
+      } else if (md.bodyIndex() != null) {
+        buildTemplate = new BuildEncodedTemplateFromArgs(md, encoder, queryMapEncoder, target);
+      } else {
+        buildTemplate = new BuildTemplateByResolvingArgs(md, queryMapEncoder, target);
+      }
+      if (md.isIgnored()) {
+        result.put(md.configKey(), args -> {
+          throw new IllegalStateException(md.configKey() + " is not a method handled by feign");
+        });
+      } else {
+        //这里使用SynchronousMethodHandler.Factory factory和所有的Feign参数创建出了SynchronousMethodHandler用于处理对应的方法请求
+        //这里的md.configKey() RandomService#getRandomNum()
+        result.put(md.configKey(),
+            factory.create(target, md, buildTemplate, options, decoder, errorDecoder));
+      }
+    }
+    return result;
+  }
+}
+```
+
+这里记录一下需要注意的关键点
+
+- `MethodMetadata`这里包含了很多方法信息，比如请求的url，返回参数，入参等等
+- `md.configKey()`是一个字符串RandomService#getRandomNum() 就是这个样子
+- 如餐Target也是一堆信息包括了@FeignClient中的一些参数信息和被@FeignClient注解注释的接口信息，比如类加载器、注解信息等等。
+
+#### 生成动态代理
+
+`  InvocationHandler handler = factory.create(target, methodToHandler)`在这个方法中就最终生成了动态代理，这里记录一下这段代码的关键点：
 
 - InvocationHandler handler = factory.create(target, methodToHandler)这段代码生成的InvocationHandler是`FeignInvocationHandler`，代码如下
 
@@ -567,6 +611,7 @@ public <T> T newInstance(Target<T> target) {
   
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+      //equals、hashCode、toString几个方法的判断调用
       if ("equals".equals(method.getName())) {
         try {
           Object otherHandler =
@@ -580,9 +625,150 @@ public <T> T newInstance(Target<T> target) {
       } else if ("toString".equals(method.getName())) {
         return toString();
       }
-  
+  		//这里就是调用对应的方法处理请求了
       return dispatch.get(method).invoke(args);
     }
   ```
 
 - MethodHandler是`SynchronousMethodHandler`Feign处理请求最终调用的就是`SynchronousMethodHandler#invoke()`方法
+
+- target就是被@FeignClient注解注释的接口的相关信息
+
+- 整个调用就是使用了JDK的动态代理方法
+
+#### 对FeignClient发起调用
+
+对FeignClient发起调用，实际上就会调用`FeignInvocationHandler#invoke()`方法，然后走到`SynchronousMethodHandler#invoke()`
+
+```java
+@Override
+public Object invoke(Object[] argv) throws Throwable {
+  //根据源数据信息和入参构建了RequestTemplate
+  RequestTemplate template = buildTemplateFromArgs.create(argv);
+  //这里构建了Feign相关的请求参数比如readTimeout、connectTimeout、时间单位等等 
+  Options options = findOptions(argv);
+  //重试器
+  Retryer retryer = this.retryer.clone();
+  while (true) {
+    try {
+      //这里从名字就可以看出来是执行Http请求并且Decode响应信息并返回
+      return executeAndDecode(template, options);
+    } catch (RetryableException e) {
+      try {
+        //这里应该跟重试相关
+        retryer.continueOrPropagate(e);
+      } catch (RetryableException th) {
+        Throwable cause = th.getCause();
+        if (propagationPolicy == UNWRAP && cause != null) {
+          throw cause;
+        } else {
+          throw th;
+        }
+      }
+      if (logLevel != Logger.Level.NONE) {
+        logger.logRetry(metadata.configKey(), logLevel);
+      }
+      continue;
+    }
+  }
+}
+```
+
+需要关注的点
+
+- 根据方法的源数据和入参构建了`RequestTemplate`，在里面包含了发送这次Http调用所需要的基本上所有信息，包括方法的信息，编码，http请求等等最终比较直观和关键的信息就是这个 `GET /random/getRandomNum HTTP/1.1Binary data `这位了后面发送Http请求做准备。
+- `Options options = findOptions(argv)`获取了Feign请求相关的一些参数读取超时时间、连接超时时间等等。
+
+结下来执行进行Http调用的`executeAndDecode（）`方法
+
+```java
+Object executeAndDecode(RequestTemplate template, Options options) throws Throwable {
+  //这里构建了要发送的Request请求 GET http://service-provider/random/getRandomNum HTTP/1.1 可以看出这里已经生成了一个完成的请求Url
+  Request request = targetRequest(template);
+
+  if (logLevel != Logger.Level.NONE) {
+    logger.logRequest(metadata.configKey(), logLevel, request);
+  }
+
+  Response response;
+  long start = System.nanoTime();
+  try {
+    //执行Http请求,注意这里的client是 LoadBalancerFeignClient
+    response = client.execute(request, options);
+    // ensure the request is set. TODO: remove in Feign 12
+    response = response.toBuilder()
+        .request(request)
+        .requestTemplate(template)
+        .build();
+  } catch (IOException e) {
+    if (logLevel != Logger.Level.NONE) {
+      logger.logIOException(metadata.configKey(), logLevel, e, elapsedTime(start));
+    }
+    throw errorExecuting(request, e);
+  }
+  long elapsedTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+
+  if (decoder != null)
+    //解码并返回
+    return decoder.decode(response, metadata.returnType());
+
+  CompletableFuture<Object> resultFuture = new CompletableFuture<>();
+  asyncResponseHandler.handleResponse(resultFuture, metadata.configKey(), response,
+      metadata.returnType(),
+      elapsedTime);
+
+  try {
+    if (!resultFuture.isDone())
+      throw new IllegalStateException("Response handling not done");
+
+    return resultFuture.join();
+  } catch (CompletionException e) {
+    .....省略一些异常处理代码
+  }
+}
+```
+
+`targetRequest(template)`方法对url进行了一系列的处理，主要做了如下这些事情
+
+```java
+Request targetRequest(RequestTemplate template) {
+  for (RequestInterceptor interceptor : requestInterceptors) {
+    interceptor.apply(template);
+  }
+  return target.apply(template);
+}
+```
+
+- 首先使用拦截器处理RequestTemplate,不过这里没有加任何拦截器
+- 调用`target.apply(template)`方法对RequestTemplate处理生成`Request`，其实就是对`RequestTemplate`中的Url字符串进行了一系列的处理最终生成的一个url串是`GET http://service-provider/random/getRandomNum HTTP/1.1`这里可以看出已经可以发送Http请求了，要请求的服务提供者也放到了url中，后面就通过Ribbon进行处理就可以了。
+
+接下来调用了`LoadBalancerFeignClient#execute()`方法
+
+```java
+@Override
+public Response execute(Request request, Request.Options options) throws IOException {
+   try {
+     //这里解析出了http的url的各个组成部分
+      URI asUri = URI.create(request.url());
+     //这里是要请求的服务提供者名称 "service-provider"
+      String clientName = asUri.getHost();
+     //这里把host从url中剔除出去http:///random/getRandomNum
+      URI uriWithoutHost = cleanUrl(request.url(), clientName);
+     //根据上面的参数生成了RibbonRequest,应该是给Ribbon用的
+      FeignLoadBalancer.RibbonRequest ribbonRequest = new FeignLoadBalancer.RibbonRequest(
+            this.delegate, request, uriWithoutHost);
+			//这里从SpringClientFacotry中取出了一些配置信息，SpringClientFacotry在Ribbon那里看过，就是维护了每个服务都有一个ApplicationContext
+      IClientConfig requestConfig = getClientConfig(options, clientName);
+     //这里比较关键，这里就是ribbon中最重要的ILoadBalanced了，这里返回的是FeignLoadBalancer
+      return lbClient(clientName)
+            .executeWithLoadBalancer(ribbonRequest, requestConfig).toResponse();
+   }
+   catch (ClientException e) {
+     ...省略一些异常代码
+   }
+}
+```
+
+总结一下，这里开始为使用Ribbon做准备，并且通过最终的`FeignLoadBalancer`这个负载均衡器进行了请求发送。
+
