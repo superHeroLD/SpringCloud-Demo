@@ -157,7 +157,7 @@ DiscoveryClient构造步骤
 
 分为亚马逊环境和非亚马逊环境两套逻辑
 
-**创建Eureka-server集群节点集合**
+**创建Eureka-server集群节点信息**
 
 ```java
 PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(
@@ -632,7 +632,7 @@ public void cancel() {
 - 设置应用实例信息的操作类型为添加，并添加到最近租约变更记录队列( `recentlyChangedQueue` )。`recentlyChangedQueue` 用于注册信息的增量获取
 - 设置响应缓存( ResponseCache )过期，`invalidateCache(appName, vip, svip)`这个方法比较重要。
 
-### Eureka启动与其他节点同步注册信息
+### Eureka启动从其他节点获取注册信息
 
 在`EurekaBootStrap#initEurekaServerContext()`在服务启动时会与别的Eureka节点进行注册信息同步，从别的Eureka节点同步注册信息。
 
@@ -883,17 +883,21 @@ public void evict(long additionalLeaseMs) {
             }
         }
     }
-
+		
     // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
     // triggering self-preservation. Without that we would wipe out full registry.
+  //获取本地所有注册的实例数量
     int registrySize = (int) getLocalRegistrySize();
+  //然后 * 0.85的阈值算出来一个注册阈值，这个值是用来计算最大过期数量的
     int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
+  //用注册服务数量 - 最大可以摘除的数量就是本次可以删除的数量
     int evictionLimit = registrySize - registrySizeThreshold;
-
+		
+  //与过期数量比较选个最小值
     int toEvict = Math.min(expiredLeases.size(), evictionLimit);
     if (toEvict > 0) {
         logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
-
+			//这里随机选取进行摘除，为了让实例摘除均匀一些
         Random random = new Random(System.currentTimeMillis());
         for (int i = 0; i < toEvict; i++) {
             // Pick a random item (Knuth shuffle algorithm)
@@ -903,13 +907,77 @@ public void evict(long additionalLeaseMs) {
 
             String appName = lease.getHolder().getAppName();
             String id = lease.getHolder().getId();
+          //这里是监控打点
             EXPIRED.increment();
             logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
+          //摘除服务实例的具体方法
             internalCancel(appName, id, false);
         }
     }
 }
 ```
+
+```java
+protected boolean internalCancel(String appName, String id, boolean isReplication) {
+    read.lock();
+    try {
+      //这里是个监控打点
+        CANCEL.increment(isReplication);
+      //从本地缓存中摘除服务实例
+        Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
+        Lease<InstanceInfo> leaseToCancel = null;
+        if (gMap != null) {
+            leaseToCancel = gMap.remove(id);
+        }
+      //将服务实例信息增加到recentCanceledQueue 中
+        recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
+      
+      //这里我没弄明白是什么意思
+        InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
+        if (instanceStatus != null) {
+            logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
+        }
+        if (leaseToCancel == null) {
+            CANCEL_NOT_FOUND.increment(isReplication);
+            logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);
+            return false;
+        } else {
+            leaseToCancel.cancel();
+            InstanceInfo instanceInfo = leaseToCancel.getHolder();
+            String vip = null;
+            String svip = null;
+            if (instanceInfo != null) {
+              //这里设置一下服务的状态
+                instanceInfo.setActionType(ActionType.DELETED);
+              //增加到最近改变队列
+                recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));
+                instanceInfo.setLastUpdatedTimestamp();
+                vip = instanceInfo.getVIPAddress();
+                svip = instanceInfo.getSecureVipAddress();
+            }
+          
+          //刷新readWriteCache
+            invalidateCache(appName, vip, svip);
+            logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
+        }
+    } finally {
+        read.unlock();
+    }
+
+    synchronized (lock) {
+        if (this.expectedNumberOfClientsSendingRenews > 0) {
+            // Since the client wants to cancel it, reduce the number of clients to send renews.
+          //这里减少一下注册服务的数量用于重新计算自我保护机制的阈值
+            this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews - 1;
+            updateRenewsPerMinThreshold();
+        }
+    }
+
+    return true;
+}
+```
+
+具体的逻辑在看上面的代码的注释吧，我发现直接在代码里写注释挺好的，其实比写大段的文字更加直观。以后我就都这么写了，而且还省事。捏哈哈哈
 
 #### Eureka自我保护机制
 
@@ -954,4 +1022,222 @@ public long getNumOfRenewsInLastMin() {
 是否开启自动保护机制的逻辑就是用上一分钟接收到的心跳数量`getNumOfRenewsInLastMin()`与期望的每分钟接收到的心跳数量做比较`numberOfRenewsPerMinThreshold`。如果没收到，那么就会认为我Eureka自己本身除了问题，那么我就不下线实例了。
 
 ### Eureka批任务处理
+
+Eureka-Server 集群通过任务批处理同步应用实例注册实例。
+
+- **不同于**一般情况下，任务提交了**立即**同步或异步执行，任务的执行拆分了**三层队列**：
+
+  - 第一层，接收队列( `acceptorQueue` )，重新处理队列( `reprocessQueue` )。
+
+    - 分发器在收到任务执行请求后，提交到接收队列，**任务实际未执行**。
+    - 执行器的工作线程处理任务失败，将符合条件的失败任务提交到重新执行队列。
+
+    - 第二层，待执行队列( `processingOrder` )
+      - 粉线：接收线程( Runner )将重新执行队列，接收队列提交到待执行队列。
+    - 第三层，工作队列( `workQueue` )
+      - 粉线：接收线程( Runner )将待执行队列的任务根据参数( `maxBatchingSize` )将任务合并成**批量任务**，调度( 提交 )到工作队列。
+      - 黄线：执行器的工作线程**池**，一个工作线程可以拉取一个**批量任务**进行执行。
+
+- **三层队列的好处**：
+
+  - 接收队列，避免处理任务的阻塞等待。
+  - 接收线程( Runner )合并任务，将相同任务编号( **是的，任务是带有编号的** )的任务合并，只执行一次。
+  - Eureka-Server 为集群同步提供批量操作**多个**应用实例的**接口**，一个**批量任务**可以一次调度接口完成，避免多次调用的开销。当然，这样做的前提是合并任务，这也导致 Eureka-Server 集群之间对应用实例的注册和下线带来更大的延迟。**毕竟，Eureka 是在 CAP 之间，选择了 AP**。
+
+  这里的细节还是挺多的，这里有时间要好好看看，因为批量任务处理这种在实际业务场景中使用的地方很多，各种设计思想应该借鉴一下。
+
+  ### Eureka-Server集群同步
+
+- Eureka-Server 集群不区分**主从节点**或者 **Primary & Secondary 节点**，所有节点**相同角色( 也就是没有角色 )，完全对等**。
+- Eureka-Client 可以向**任意** Eureka-Client 发起任意**读写**操作，Eureka-Server 将操作复制到另外的 Eureka-Server 以达到**最终一致性**。注意，Eureka-Server 是选择了 AP 的组件。
+
+在`EurekaBootStrap#initEurekaServerContext()`方法中,构建了`PeerEurekaNodes`这里面就是同步Eureka-Server集群信息。
+
+```java
+PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(
+        registry,
+        eurekaServerConfig,
+        eurekaClient.getEurekaClientConfig(),
+        serverCodecs,
+        applicationInfoManager
+);
+```
+
+在`PeerEurekaNodes#start()`方法中进行了集群同步。
+
+```java
+public void start() {
+  //启动一个单线程的线程池做任务执行线程
+    taskExecutor = Executors.newSingleThreadScheduledExecutor(
+            new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread thread = new Thread(r, "Eureka-PeerNodesUpdater");
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            }
+    );
+    try {
+      //获取所有集群Url并且依次通过这些URL请求同步集群信息
+        updatePeerEurekaNodes(resolvePeerUrls());
+      //声明一个集群信息同步任务
+        Runnable peersUpdateTask = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    updatePeerEurekaNodes(resolvePeerUrls());
+                } catch (Throwable e) {
+                    logger.error("Cannot update the replica Nodes", e);
+                }
+
+            }
+        };
+      //启动定时任务，每10分钟同步一次(10 * 60 * 1000) Eureka集群
+        taskExecutor.scheduleWithFixedDelay(
+                peersUpdateTask,
+                serverConfig.getPeerEurekaNodesUpdateIntervalMs(),
+                serverConfig.getPeerEurekaNodesUpdateIntervalMs(),
+                TimeUnit.MILLISECONDS
+        );
+    } catch (Exception e) {
+        throw new IllegalStateException(e);
+    }
+    for (PeerEurekaNode node : peerEurekaNodes) {
+        logger.info("Replica node URL:  {}", node.getServiceUrl());
+    }
+}
+```
+
+下面开始对上面的代码中的一些方法进行详细的解析,在`resolvePeerUrls()`方法中获取了所有的Eureka机器Url
+
+```java
+protected List<String> resolvePeerUrls() {
+  //从ApplicationInfoManager中获取自己的实例信息
+    InstanceInfo myInfo = applicationInfoManager.getInfo();
+    String zone = InstanceInfo.getZone(clientConfig.getAvailabilityZones(clientConfig.getRegion()), myInfo);
+  //这里就获取了所有的Eureka集群信息，其实就是从配置文件中读取了所有的serverUrl，用逗号分隔的  
+  List<String> replicaUrls = EndpointUtils
+            .getDiscoveryServiceUrls(clientConfig, zone, new EndpointUtils.InstanceInfoBasedUrlRandomizer(myInfo));
+
+    int idx = 0;
+  //这里把自己从同步信息里去掉，不用同步自己的信息
+    while (idx < replicaUrls.size()) {
+        if (isThisMyUrl(replicaUrls.get(idx))) {
+            replicaUrls.remove(idx);
+        } else {
+            idx++;
+        }
+    }
+    return replicaUrls;
+}
+```
+
+在`updatePeerEurekaNodes`方法中创建了集群实例`PeerEurekaNode`，并且做了一些`PeerEurekaNode`的初始化工作，创建了一下批量任务执行器等操作
+
+```java
+protected void updatePeerEurekaNodes(List<String> newPeerUrls) {
+    if (newPeerUrls.isEmpty()) {
+        logger.warn("The replica size seems to be empty. Check the route 53 DNS Registry");
+        return;
+    }
+		//下面这一些逻辑没弄太懂，有一些URL不会进行同步
+    Set<String> toShutdown = new HashSet<>(peerEurekaNodeUrls);
+    toShutdown.removeAll(newPeerUrls);
+    Set<String> toAdd = new HashSet<>(newPeerUrls);
+    toAdd.removeAll(peerEurekaNodeUrls);
+
+    if (toShutdown.isEmpty() && toAdd.isEmpty()) { // No change
+        return;
+    }
+
+    // Remove peers no long available
+    List<PeerEurekaNode> newNodeList = new ArrayList<>(peerEurekaNodes);
+
+    if (!toShutdown.isEmpty()) {
+        logger.info("Removing no longer available peer nodes {}", toShutdown);
+        int i = 0;
+        while (i < newNodeList.size()) {
+            PeerEurekaNode eurekaNode = newNodeList.get(i);
+            if (toShutdown.contains(eurekaNode.getServiceUrl())) {
+                newNodeList.remove(i);
+                eurekaNode.shutDown();
+            } else {
+                i++;
+            }
+        }
+    }
+
+    // Add new peers
+    if (!toAdd.isEmpty()) {
+        logger.info("Adding new peer nodes {}", toAdd);
+        for (String peerUrl : toAdd) {
+          //这里创建了一个PeerEurekaNode节点
+            newNodeList.add(createPeerEurekaNode(peerUrl));
+        }
+    }
+
+    this.peerEurekaNodes = newNodeList;
+    this.peerEurekaNodeUrls = new HashSet<>(newPeerUrls);
+}
+```
+
+在`createPeerEurekaNode()`进行了Eureka集群节点信息同步，并且进行了相关初始化。
+
+```java
+protected PeerEurekaNode createPeerEurekaNode(String peerEurekaNodeUrl) {
+  //这里明显初始化了一个Http客户端，用于后面与其他Client进行节点信息同步的
+    HttpReplicationClient replicationClient = JerseyReplicationClient.createReplicationClient(serverConfig, serverCodecs, peerEurekaNodeUrl);
+    String targetHost = hostFromUrl(peerEurekaNodeUrl);
+    if (targetHost == null) {
+        targetHost = "host";
+    }
+  //创建了一个PeerEurekaNode节点，并完成初始化
+    return new PeerEurekaNode(registry, targetHost, peerEurekaNodeUrl, replicationClient, serverConfig);
+}
+```
+
+```java
+PeerEurekaNode(PeerAwareInstanceRegistry registry, String targetHost, String serviceUrl,
+                                 HttpReplicationClient replicationClient, EurekaServerConfig config,
+                                 int batchSize, long maxBatchingDelayMs,
+                                 long retrySleepTimeMs, long serverUnavailableSleepTimeMs) {
+    this.registry = registry;
+    this.targetHost = targetHost;
+    this.replicationClient = replicationClient;
+
+    this.serviceUrl = serviceUrl;
+    this.config = config;
+    this.maxProcessingDelayMs = config.getMaxTimeForReplication();
+		
+  //下面创建了跟批量任务处理相关的东西
+    String batcherName = getBatcherName();
+    ReplicationTaskProcessor taskProcessor = new ReplicationTaskProcessor(targetHost, replicationClient);
+  //批量任务分发器 
+  this.batchingDispatcher = TaskDispatchers.createBatchingTaskDispatcher(
+            batcherName,
+            config.getMaxElementsInPeerReplicationPool(),
+            batchSize,
+            config.getMaxThreadsForPeerReplication(),
+            maxBatchingDelayMs,
+            serverUnavailableSleepTimeMs,
+            retrySleepTimeMs,
+            taskProcessor
+    );
+  //单任务分发器
+    this.nonBatchingDispatcher = TaskDispatchers.createNonBatchingTaskDispatcher(
+            targetHost,
+            config.getMaxElementsInStatusReplicationPool(),
+            config.getMaxThreadsForStatusReplication(),
+            maxBatchingDelayMs,
+            serverUnavailableSleepTimeMs,
+            retrySleepTimeMs,
+            taskProcessor
+    );
+}
+```
+
+### Eureka同步注册信息
+
+- Eureka-Server 接收到 Eureka-Client 的 Register、Heartbeat、Cancel、StatusUpdate、DeleteStatusOverride 操作，固定间隔( 默认值 ：500 毫秒，可配 )向 Eureka-Server 集群内其他节点同步( **准实时，非实时** )。
 
