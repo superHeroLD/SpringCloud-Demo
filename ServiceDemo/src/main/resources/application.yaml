@@ -1,0 +1,20 @@
+server:
+  port: 2100
+spring:
+  application:
+    name: service-consumer
+  cloud:
+    loadbalancer:
+      ribbon:
+        enabled: true
+
+#Eureka 配置
+eureka:
+  client:
+    fetch-registry: true
+    register-with-eureka: true
+    registry-fetch-interval-seconds: 5
+    service-url:
+      defaultZone: http://localhost:8260/eureka
+  instance:
+    prefer-ip-address: true
