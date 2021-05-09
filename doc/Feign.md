@@ -819,3 +819,222 @@ private volatile Map<String, FeignLoadBalancer> cache = new ConcurrentReferenceH
 
 **关键点，其实Feign与Ribbon整合时，也是通过从SpringClientFacotry中取出了默认的ILoaderBalancer ZoneAwareLoadBalancer，这样Ribbon就跟Feign和Erucke整合起来了，也就是在`ZoneAwareLoadBalancer`的父类`DynamicServerListLoadBalancer`启动的时候会在构造类中调用`updateListOfServers`方法，这个方法就是通过Eureka-Client客户群与Eureka-Server进行通信获取了所有服务列表，然后放在了本地缓存中，并且启动一个`PollingServerListUpdater()` 任务，每30秒从Eureka中重新获取一下服务信息。**
 
+#### Feign执行Http调用
+
+```java
+public T executeWithLoadBalancer(final S request, final IClientConfig requestConfig) throws ClientException {
+        LoadBalancerCommand<T> command = buildLoadBalancerCommand(request, requestConfig);
+    try {
+      //注意这里调用了`LoadBalancerCommand`类的submit方法提交了发送http请求的命令
+        return command.submit(
+            new ServerOperation<T>() {
+                @Override
+                public Observable<T> call(Server server) {
+                  //这里会生成最终的请求URL http://192.168.199.179:2200/random/getRandomNum
+                    URI finalUri = reconstructURIWithServer(server, request.getUri());
+                    S requestForServer = (S) request.replaceUri(finalUri);
+                    try {
+                      //调用FeignLoadBalancer#execute 方法发送Http请求
+                        return Observable.just(AbstractLoadBalancerAwareClient.this.execute(requestForServer, requestConfig));
+                    } 
+                    catch (Exception e) {
+                        return Observable.error(e);
+                    }
+                }
+            })
+            .toBlocking()
+            .single();
+    } catch (Exception e) {
+      ...省略一些异常代码
+    }
+}
+```
+
+从上面的代码中可以知道，其实Feign发送Http请求的最后核心代码在`LoadBalancerCommand#submit()`方法中
+
+```java
+public Observable<T> submit(final ServerOperation<T> operation) {
+    final ExecutionInfoContext context = new ExecutionInfoContext();
+    
+    if (listenerInvoker != null) {
+        try {
+            listenerInvoker.onExecutionStart();
+        } catch (AbortExecutionException e) {
+            return Observable.error(e);
+        }
+    }
+		
+  //根重试请求有关
+    final int maxRetrysSame = retryHandler.getMaxRetriesOnSameServer();
+    final int maxRetrysNext = retryHandler.getMaxRetriesOnNextServer();
+
+    // Use the load balancer
+    Observable<T> o = 
+      //这里根据ILoaderBalancer 选择了Server
+            (server == null ? selectServer() : Observable.just(server))
+            .concatMap(new Func1<Server, Observable<T>>() {
+                @Override
+                // Called for each server being selected
+                public Observable<T> call(Server server) {
+                    context.setServer(server);
+                    final ServerStats stats = loadBalancerContext.getServerStats(server);
+                    
+                    // Called for each attempt and retry
+                    Observable<T> o = Observable
+                            .just(server)
+                            .concatMap(new Func1<Server, Observable<T>>() {
+                                @Override
+                                public Observable<T> call(final Server server) {
+                                    context.incAttemptCount();
+                                    loadBalancerContext.noteOpenConnection(stats);
+                                    
+                                    if (listenerInvoker != null) {
+                                        try {
+                                            listenerInvoker.onStartWithServer(context.toExecutionInfo());
+                                        } catch (AbortExecutionException e) {
+                                            return Observable.error(e);
+                                        }
+                                    }
+                                    
+                                    final Stopwatch tracer = loadBalancerContext.getExecuteTracer().start();
+                                    
+                                  //这里就执行了上面重写了的call方法，然后在方法返回结果后执行了一些后续的记录方法
+                                    return operation.call(server).doOnEach(new Observer<T>() {
+                                        private T entity;
+                                        @Override
+                                        public void onCompleted() {
+                                            recordStats(tracer, stats, entity, null);
+                                            // TODO: What to do if onNext or onError are never called?
+                                        }
+
+                                        @Override
+                                        public void onError(Throwable e) {
+                                            recordStats(tracer, stats, null, e);
+                                            logger.debug("Got error {} when executed on server {}", e, server);
+                                            if (listenerInvoker != null) {
+                                                listenerInvoker.onExceptionWithServer(e, context.toExecutionInfo());
+                                            }
+                                        }
+
+                                        @Override
+                                        public void onNext(T entity) {
+                                            this.entity = entity;
+                                            if (listenerInvoker != null) {
+                                                listenerInvoker.onExecutionSuccess(entity, context.toExecutionInfo());
+                                            }
+                                        }                            
+                                        
+                                        private void recordStats(Stopwatch tracer, ServerStats stats, Object entity, Throwable exception) {
+                                            tracer.stop();
+                                            loadBalancerContext.noteRequestCompletion(stats, entity, exception, tracer.getDuration(TimeUnit.MILLISECONDS), retryHandler);
+                                        }
+                                    });
+                                }
+                            });
+                    
+                    if (maxRetrysSame > 0) 
+                        o = o.retry(retryPolicy(maxRetrysSame, true));
+                    return o;
+                }
+            });
+        
+    if (maxRetrysNext > 0 && server == null) 
+        o = o.retry(retryPolicy(maxRetrysNext, false));
+    
+    return o.onErrorResumeNext(new Func1<Throwable, Observable<T>>() {
+        @Override
+        public Observable<T> call(Throwable e) {
+            if (context.getAttemptCount() > 0) {
+                if (maxRetrysNext > 0 && context.getServerAttemptCount() == (maxRetrysNext + 1)) {
+                    e = new ClientException(ClientException.ErrorType.NUMBEROF_RETRIES_NEXTSERVER_EXCEEDED,
+                            "Number of retries on next server exceeded max " + maxRetrysNext
+                            + " retries, while making a call for: " + context.getServer(), e);
+                }
+                else if (maxRetrysSame > 0 && context.getAttemptCount() == (maxRetrysSame + 1)) {
+                    e = new ClientException(ClientException.ErrorType.NUMBEROF_RETRIES_EXEEDED,
+                            "Number of retries exceeded max " + maxRetrysSame
+                            + " retries, while making a call for: " + context.getServer(), e);
+                }
+            }
+            if (listenerInvoker != null) {
+                listenerInvoker.onExecutionFailed(e, context.toFinalExecutionInfo());
+            }
+            return Observable.error(e);
+        }
+    });
+}
+```
+
+这里的一段代码是用RxJava写的，我以后也可以借鉴这段代码写RxJava相关的代码。
+
+submit主要做了如下工作：
+
+- 整理了一下重试相关的参数，这里的重试参数都是ribbon的
+- 通过selectServer()负载均衡获得了一个要请求的Server信息，这后面的代码太长了，最终还是调用了ILoadBalancer的chooseServer(loadBalancerKey)方法获取的Server实例。
+- 然后执行了call方法进行http请求
+- 如果出现异常，那么在异常处理阶段根据重试参数的配置进行重试。
+
+```java
+@Override
+public RibbonResponse execute(RibbonRequest request, IClientConfig configOverride)
+      throws IOException {
+  //重试相关的参数
+   Request.Options options;
+   if (configOverride != null) {
+      RibbonProperties override = RibbonProperties.from(configOverride);
+      options = new Request.Options(override.connectTimeout(connectTimeout),
+            TimeUnit.MILLISECONDS, override.readTimeout(readTimeout),
+            TimeUnit.MILLISECONDS, override.isFollowRedirects(followRedirects));
+   }
+   else {
+      options = new Request.Options(connectTimeout, TimeUnit.MILLISECONDS,
+            readTimeout, TimeUnit.MILLISECONDS, followRedirects);
+   }
+  //这里就是发送Http请求了
+   Response response = request.client().execute(request.toRequest(), options);
+   return new RibbonResponse(request.getUri(), response);
+}
+```
+
+最终方法通过`FeignLoadBalancer#execute()`方法将请求发送出去，这里最后会通过`package feign # Client类` 中的默认实现类`class Default#execute`方法将请求发送出去
+
+```java
+@Override
+public Response execute(Request request, Options options) throws IOException {
+  //这里就是通过一个数据流把请求发送出去的，有点厉害
+  HttpURLConnection connection = convertAndSend(request, options);
+  return convertResponse(connection, request);
+}
+```
+
+```java
+//convertAndSend中的代码
+connection.setDoOutput(true);
+OutputStream out = connection.getOutputStream();
+if (gzipEncodedRequest) {
+  out = new GZIPOutputStream(out);
+} else if (deflateEncodedRequest) {
+  out = new DeflaterOutputStream(out);
+}
+try {
+  out.write(request.body());
+} finally {
+  try {
+    out.close();
+  } catch (IOException suppressed) { // NOPMD
+  }
+}
+```
+
+网络通信这块的底层都快忘了，还是得看看。
+
+#### Feign处理响应请求
+
+在别的服务响应请求之后，在`SynchronousMethodHandler#executeAndDecode`方法中会进行对响应Response进行处理，最重要的就是对Response中的body进行Decode
+
+```java
+if (decoder != null)
+  return decoder.decode(response, metadata.returnType());
+```
+
+这段代码就会根据方法需要的返回值将body decode成对应的类型。
