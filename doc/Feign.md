@@ -772,3 +772,50 @@ public Response execute(Request request, Request.Options options) throws IOExcep
 
 总结一下，这里开始为使用Ribbon做准备，并且通过最终的`FeignLoadBalancer`这个负载均衡器进行了请求发送。
 
+#### 与Feign与Ribbon整合逻辑
+
+在`LoadBalancerFeignClient#execute()`方法中，最后调用了`LoadBalancerFeignClient#lbClient()`方法生成了`FeignLoadBalancer`
+
+```java
+private FeignLoadBalancer lbClient(String clientName) {
+   return this.lbClientFactory.create(clientName);
+}
+```
+
+上面这段代码最终调用到了`CachingSpringLoadBalancerFactory#create()`方法
+
+```java
+public FeignLoadBalancer create(String clientName) {
+  //这里clientName传入的是service-provider
+   FeignLoadBalancer client = this.cache.get(clientName);
+   if (client != null) {
+      return client;
+   }
+  //这里从SpringClientFacotry中拿出了客户端配置
+   IClientConfig config = this.factory.getClientConfig(clientName);
+  //这里从SpringClientFactory中生成了默认的ILoaderBalancer ZoneAwareLoadBalancer
+   ILoadBalancer lb = this.factory.getLoadBalancer(clientName);
+  //这里获取了EurekaServerIntrospector 
+   ServerIntrospector serverIntrospector = this.factory.getInstance(clientName,
+         ServerIntrospector.class);
+  //这里根据上面生成的类生成了FeignLoadBalancer
+   client = this.loadBalancedRetryFactory != null
+         ? new RetryableFeignLoadBalancer(lb, config, serverIntrospector,
+               this.loadBalancedRetryFactory)
+         : new FeignLoadBalancer(lb, config, serverIntrospector);
+  //放入缓存中
+   this.cache.put(clientName, client);
+  //返回客户端
+   return client;
+}
+```
+
+`CachingSpringLoadBalancerFactory`类中缓存了每个FeignClient对应的FeignLoadBalancer，这样以后每次发起Http调用就不用再每次生成了
+
+```java
+//Spring还自己实现了一些工具类，这个有点厉害呢ConcurrentReferenceHashMap
+private volatile Map<String, FeignLoadBalancer> cache = new ConcurrentReferenceHashMap<>();
+```
+
+**关键点，其实Feign与Ribbon整合时，也是通过从SpringClientFacotry中取出了默认的ILoaderBalancer ZoneAwareLoadBalancer，这样Ribbon就跟Feign和Erucke整合起来了，也就是在`ZoneAwareLoadBalancer`的父类`DynamicServerListLoadBalancer`启动的时候会在构造类中调用`updateListOfServers`方法，这个方法就是通过Eureka-Client客户群与Eureka-Server进行通信获取了所有服务列表，然后放在了本地缓存中，并且启动一个`PollingServerListUpdater()` 任务，每30秒从Eureka中重新获取一下服务信息。**
+
