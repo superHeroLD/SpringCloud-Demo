@@ -8,7 +8,7 @@ spring:
       ribbon:
         enabled: true
 
-#Eureka 配置
+#Eureka配置
 eureka:
   client:
     fetch-registry: true
