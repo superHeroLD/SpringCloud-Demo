@@ -27,7 +27,7 @@
 - StatusFilter：状态过滤器
 - ServerRequestAuthFilter：Eureka-Server 请求认证过滤器
 - RateLimitingFilterL：实现限流
-- GzipEncodingEnforcingFilter：GZIO编码过滤
+- GzipEncodingEnforcingFilter：GZIP编码过滤
 - ServletContainer：Jersey MVC请求过滤器
 
 通过<filter-mapping>可知StatusFilter和ServerRequestAuthFilter是对所有请求都开放的。RateLimitingFilter，默认是不开启的，如果需要打开eurka-server内置的限流功能，需要自己吧RateLimitingFilter的<filter-mapping>注释打开。GzipEncodingEnforcingFilter拦截/v2/apps相关的请求。Jersery的核心filter是默认拦截所有请求的。
@@ -50,9 +50,21 @@ EurekaServerConfig其实是基于配置文件实现的Eureka-server的配置类�
 
 initEurekaServerContext()方法中，EurekaServerConfig eurekaServerConfig = new DefaultEurekaServerConfig()这一行代码会进行初始化eureka-server的相关配置。initEurekaEnvironment()方法负责初始化eureka-server的环境。在里面会调用ConfigurationManager.getConfigInstance()方法，这个方法的作用就是在初始化ConfigurationManager的实例，ConfigurationManager从字面上就能看出来是一个配置管理器，负责将配置文件中的配置加载进来供后面的Eurka初始化使用（后面会说到，没有配置的话会自动使用默认配置）。
 
->  这里注意一下ConfigurationManager初始化使用了Double check形式的单例模式（TODO 后面把代码贴上来），一般我看开源项目中，使用内部类单例的比较少，大部分都使用了DoubleCheck形式的单例模式，DoubleCheck的单例模式需要重点注意一点就是使用volatile关键字修饰单例对象，不然在多线程的情况下，有可能初始化多次。
+>  这里注意一下ConfigurationManager初始化使用了Double check形式的单例模式，一般我看开源项目中，使用内部类单例的比较少，大部分都使用了DoubleCheck形式的单例模式，DoubleCheck的单例模式需要重点注意一点就是使用volatile关键字修饰单例对象，不然在多线程的情况下，有可能初始化多次。
 >
->  ![14097005894197ee0f7e2b3a9fed7730.png](evernotecid://62E7E6AC-1793-4D73-AE1C-84E43655EB8F/appyinxiangcom/18219242/ENResource/p870)
+>  ```java
+>  static volatile AbstractConfiguration instance = null;
+>  public static AbstractConfiguration getConfigInstance() {
+>      if (instance == null) {
+>          synchronized (ConfigurationManager.class) {
+>              if (instance == null) {
+>                  instance = getConfigInstance(Boolean.getBoolean(DynamicPropertyFactory.DISABLE_DEFAULT_CONFIG));
+>              }
+>          }
+>      }
+>      return instance;
+>  }
+>  ```
 
 **initEurekaEnvironment中ConfigurationManager初始化流程**
 
@@ -324,25 +336,7 @@ Applications 与 InstanceInfo 类关系如下：**Applications** 1:N **Applicati
 Eureka-Client 获取注册信息，分成全量获取和增量获取。默认配置下，Eureka-Client 启动时，首先执行一次全量获取进行本地缓存注册信息，而后每 **30** 秒增量获取刷新本地缓存( 非正常情况下会是全量获取，对比注册信息哈希值不一致)，Eureka-Client在启动时会执行下面这段代码，根据`shouldFetchRegistry == true`配置判断是否拉取注册信息，通过fetchRegistry(false)方法获取全量注册信息。
 
 ```java
-if (clientConfig.shouldFetchRegistry()) {
-    try {
-        boolean primaryFetchRegistryResult = fetchRegistry(false);
-        if (!primaryFetchRegistryResult) {
-            logger.info("Initial registry fetch from primary servers failed");
-        }
-        boolean backupFetchRegistryResult = true;
-        if (!primaryFetchRegistryResult && !fetchRegistryFromBackup()) {
-            backupFetchRegistryResult = false;
-            logger.info("Initial registry fetch from backup servers failed");
-        }
-        if (!primaryFetchRegistryResult && !backupFetchRegistryResult && clientConfig.shouldEnforceFetchRegistryAtInit()) {
-            throw new IllegalStateException("Fetch registry error at startup. Initial fetch failed.");
-        }
-    } catch (Throwable th) {
-        logger.error("Fetch registry error at startup: {}", th.getMessage());
-        throw new IllegalStateException(th);
-    }
-}
+if (clientConfig.shouldFetchRegistry()) {    try {        boolean primaryFetchRegistryResult = fetchRegistry(false);        if (!primaryFetchRegistryResult) {            logger.info("Initial registry fetch from primary servers failed");        }        boolean backupFetchRegistryResult = true;        if (!primaryFetchRegistryResult && !fetchRegistryFromBackup()) {            backupFetchRegistryResult = false;            logger.info("Initial registry fetch from backup servers failed");        }        if (!primaryFetchRegistryResult && !backupFetchRegistryResult && clientConfig.shouldEnforceFetchRegistryAtInit()) {            throw new IllegalStateException("Fetch registry error at startup. Initial fetch failed.");        }    } catch (Throwable th) {        logger.error("Fetch registry error at startup: {}", th.getMessage());        throw new IllegalStateException(th);    }}
 ```
 
 这个方法最终会通过jerseyClient使用Get请求到`ApplicationsResource#getContainers()`获取Applications信息。
@@ -352,23 +346,7 @@ if (clientConfig.shouldFetchRegistry()) {
 Eureka-Client 在初始化过程中，创建获取注册信息线程，固定间隔30S向 Eureka-Server 发起获取注册信息( fetch )，刷新本地注册信息缓存。具体实现在`initScheduledTasks()`方法中创建了`CacheRefreshThread()`任务，`client.refresh.interval`配置为具体的执行时间间隔，默认为30S
 
 ```java
-if (clientConfig.shouldFetchRegistry()) {
-    // registry cache refresh timer
-    int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();
-    int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();
-    cacheRefreshTask = new TimedSupervisorTask(
-            "cacheRefresh",
-            scheduler,
-            cacheRefreshExecutor,
-            registryFetchIntervalSeconds,
-            TimeUnit.SECONDS,
-            expBackOffBound,
-            new CacheRefreshThread()
-    );
-    scheduler.schedule(
-            cacheRefreshTask,
-            registryFetchIntervalSeconds, TimeUnit.SECONDS);
-}
+if (clientConfig.shouldFetchRegistry()) {    // registry cache refresh timer    int registryFetchIntervalSeconds = clientConfig.getRegistryFetchIntervalSeconds();    int expBackOffBound = clientConfig.getCacheRefreshExecutorExponentialBackOffBound();    cacheRefreshTask = new TimedSupervisorTask(            "cacheRefresh",            scheduler,            cacheRefreshExecutor,            registryFetchIntervalSeconds,            TimeUnit.SECONDS,            expBackOffBound,            new CacheRefreshThread()    );    scheduler.schedule(            cacheRefreshTask,            registryFetchIntervalSeconds, TimeUnit.SECONDS);}
 ```
 
 在`CacheRefreshThread()`中调用`fetchRegistry（）`方法获取注册信息。获取注册信息后回更新注册信息的应用实例数，最后回去注册信息的时间。
@@ -378,50 +356,7 @@ if (clientConfig.shouldFetchRegistry()) {
 调用 `#fetchRegistry(false)` 方法，从 Eureka-Server 获取注册信息( 根据条件判断，可能是**全量**，也可能是**增量** )。fetchRegistry()方法中的逻辑我觉得比较重要，所有没有节省篇幅把代码都贴上来了。
 
 ```java
-private boolean fetchRegistry(boolean forceFullRegistryFetch) {
-    Stopwatch tracer = FETCH_REGISTRY_TIMER.start();
-
-    try {
-        // If the delta is disabled or if it is the first time, get all
-        // applications
-        Applications applications = getApplications();
-
-        if (clientConfig.shouldDisableDelta()
-                || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))
-                || forceFullRegistryFetch
-                || (applications == null)
-                || (applications.getRegisteredApplications().size() == 0)
-                || (applications.getVersion() == -1)) //Client application does not have latest library supporting delta
-        {
-            logger.info("Disable delta property : {}", clientConfig.shouldDisableDelta());
-            logger.info("Single vip registry refresh property : {}", clientConfig.getRegistryRefreshSingleVipAddress());
-            logger.info("Force full registry fetch : {}", forceFullRegistryFetch);
-            logger.info("Application is null : {}", (applications == null));
-            logger.info("Registered Applications size is zero : {}",
-                    (applications.getRegisteredApplications().size() == 0));
-            logger.info("Application version is -1: {}", (applications.getVersion() == -1));
-            getAndStoreFullRegistry();
-        } else {
-            getAndUpdateDelta(applications);
-        }
-        applications.setAppsHashCode(applications.getReconcileHashCode());
-        logTotalInstances();
-    } catch (Throwable e) {
-        logger.info(PREFIX + "{} - was unable to refresh its cache! This periodic background refresh will be retried in {} seconds. status = {} stacktrace = {}",
-                appPathIdentifier, clientConfig.getRegistryFetchIntervalSeconds(), e.getMessage(), ExceptionUtils.getStackTrace(e));
-        return false;
-    } finally {
-        if (tracer != null) {
-            tracer.stop();
-        }
-    }
-    // Notify about cache refresh before updating the instance remote status
-    onCacheRefreshed();
-    // Update remote status based on refreshed data held in the cache
-    updateInstanceRemoteStatus();
-    // registry was fetched successfully, so return true
-    return true;
-}
+private boolean fetchRegistry(boolean forceFullRegistryFetch) {    Stopwatch tracer = FETCH_REGISTRY_TIMER.start();    try {        // If the delta is disabled or if it is the first time, get all        // applications        Applications applications = getApplications();        if (clientConfig.shouldDisableDelta()                || (!Strings.isNullOrEmpty(clientConfig.getRegistryRefreshSingleVipAddress()))                || forceFullRegistryFetch                || (applications == null)                || (applications.getRegisteredApplications().size() == 0)                || (applications.getVersion() == -1)) //Client application does not have latest library supporting delta        {            logger.info("Disable delta property : {}", clientConfig.shouldDisableDelta());            logger.info("Single vip registry refresh property : {}", clientConfig.getRegistryRefreshSingleVipAddress());            logger.info("Force full registry fetch : {}", forceFullRegistryFetch);            logger.info("Application is null : {}", (applications == null));            logger.info("Registered Applications size is zero : {}",                    (applications.getRegisteredApplications().size() == 0));            logger.info("Application version is -1: {}", (applications.getVersion() == -1));            getAndStoreFullRegistry();        } else {            getAndUpdateDelta(applications);        }        applications.setAppsHashCode(applications.getReconcileHashCode());        logTotalInstances();    } catch (Throwable e) {        logger.info(PREFIX + "{} - was unable to refresh its cache! This periodic background refresh will be retried in {} seconds. status = {} stacktrace = {}",                appPathIdentifier, clientConfig.getRegistryFetchIntervalSeconds(), e.getMessage(), ExceptionUtils.getStackTrace(e));        return false;    } finally {        if (tracer != null) {            tracer.stop();        }    }    // Notify about cache refresh before updating the instance remote status    onCacheRefreshed();    // Update remote status based on refreshed data held in the cache    updateInstanceRemoteStatus();    // registry was fetched successfully, so return true    return true;}
 ```
 
 具体逻辑如下：
@@ -435,9 +370,7 @@ private boolean fetchRegistry(boolean forceFullRegistryFetch) {
 - `onCacheRefreshed()`触发 CacheRefreshedEvent 事件，事件监听器执行。目前 Eureka 未提供默认的该事件监听器。可以实现自定义的事件监听器监听 CacheRefreshedEvent 事件，以达到**持久化**最新的注册信息到存储器( 例如，本地文件 )，通过这样的方式，配合实现 BackupRegistry 接口读取存储器。BackupRegistry 接口调用如下:
 
   ```java
-  if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {
-      fetchRegistryFromBackup();
-  }
+  if (clientConfig.shouldFetchRegistry() && !fetchRegistry(false)) {    fetchRegistryFromBackup();}
   ```
 
 - `updateInstanceRemoteStatus()`更新本地缓存的当前应用实例在Eureka-Server的状态，对比**本地缓存**和**最新的**的当前应用实例在 Eureka-Server 的状态，若不同，更新**本地缓存**( **注意，只更新该缓存变量，不更新本地当前应用实例的状态( `instanceInfo.status` )** )，触发 StatusChangeEvent 事件，事件监听器执行。目前 Eureka 未提供默认的该事件监听器。
@@ -486,32 +419,7 @@ expireAfterWrite(serverConfig.getResponseCacheAutoExpirationInSeconds())
 定时任务对比 `readWriteCacheMap` 和 `readOnlyCacheMap` 的缓存值，若不一致，以前者为主。通过这样的方式，实现了 `readOnlyCacheMap` 的定时过期。实现代码如下：
 
 ```java
-private TimerTask getCacheUpdateTask() {
-    return new TimerTask() {
-        @Override
-        public void run() {
-            logger.debug("Updating the client cache from response cache");
-            for (Key key : readOnlyCacheMap.keySet()) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("Updating the client cache from response cache for key : {} {} {} {}",
-                            key.getEntityType(), key.getName(), key.getVersion(), key.getType());
-                }
-                try {
-                    CurrentRequestVersion.set(key.getVersion());
-                    Value cacheValue = readWriteCacheMap.get(key);
-                    Value currentCacheValue = readOnlyCacheMap.get(key);
-                    if (cacheValue != currentCacheValue) {
-                        readOnlyCacheMap.put(key, cacheValue);
-                    }
-                } catch (Throwable th) {
-                    logger.error("Error while updating the client cache from response cache for key {}", key.toStringCompact(), th);
-                } finally {
-                    CurrentRequestVersion.remove();
-                }
-            }
-        }
-    };
-}
+private TimerTask getCacheUpdateTask() {    return new TimerTask() {        @Override        public void run() {            logger.debug("Updating the client cache from response cache");            for (Key key : readOnlyCacheMap.keySet()) {                if (logger.isDebugEnabled()) {                    logger.debug("Updating the client cache from response cache for key : {} {} {} {}",                            key.getEntityType(), key.getName(), key.getVersion(), key.getType());                }                try {                    CurrentRequestVersion.set(key.getVersion());                    Value cacheValue = readWriteCacheMap.get(key);                    Value currentCacheValue = readOnlyCacheMap.get(key);                    if (cacheValue != currentCacheValue) {                        readOnlyCacheMap.put(key, cacheValue);                    }                } catch (Throwable th) {                    logger.error("Error while updating the client cache from response cache for key {}", key.toStringCompact(), th);                } finally {                    CurrentRequestVersion.remove();                }            }        }    };}
 ```
 
 - 初始化定时任务。配置 `eureka.responseCacheUpdateIntervalMs`，设置任务执行频率，默认值 ：30 * 1000 毫秒。
@@ -555,17 +463,7 @@ Eureka-Client 将**变化**的应用集合和**本地缓存**的应用集合进�
 通过`ApplicationsRescoure#getContainerDifferential()`方法处理增量获取请求，`ResponseCacheImpl`会根据不同的key由不同的缓存处理逻辑，对应的代码在``ResponseCacheImpl#ResponseCacheImpl()`的构造方法中，在初始化readWriteCacheMap时有一段代码如下：
 
 ```java
-.build(new CacheLoader<Key, Value>() {
-    @Override
-    public Value load(Key key) throws Exception {
-        if (key.hasRegions()) {
-            Key cloneWithNoRegions = key.cloneWithoutRegions();
-            regionSpecificKeys.put(cloneWithNoRegions, key);
-        }
-        Value value = generatePayload(key);
-        return value;
-    }
-});
+.build(new CacheLoader<Key, Value>() {    @Override    public Value load(Key key) throws Exception {        if (key.hasRegions()) {            Key cloneWithNoRegions = key.cloneWithoutRegions();            regionSpecificKeys.put(cloneWithNoRegions, key);        }        Value value = generatePayload(key);        return value;    }});
 ```
 
 其中`generatePayload(key)`方法有不同的key对应的缓存的生成逻辑。值得注意的是增量拉取注册信息的时候，Eureka通过维护一个最近租约变更队列维护了增量信息。
@@ -599,13 +497,7 @@ Eureka-Client 将**变化**的应用集合和**本地缓存**的应用集合进�
 `InstanceResource`，处理**单个**应用实例信息的请求操作的 Resource。线应用实例信息的请求，映射 `InstanceResource#cancelLease()` 方法，调用 `PeerAwareInstanceRegistryImpl#cancel(...)` 方法，下线应用实例。
 
 ```java
-public boolean cancel(final String appName, final String id, final boolean isReplication) {
-    if (super.cancel(appName, id, isReplication)) {
-        replicateToPeers(Action.Cancel, appName, id, null, null, isReplication);
-        return true;
-    }
-    return false;
-}
+public boolean cancel(final String appName, final String id, final boolean isReplication) {    if (super.cancel(appName, id, isReplication)) {        replicateToPeers(Action.Cancel, appName, id, null, null, isReplication);        return true;    }    return false;}
 ```
 
 - 调用父类 `AbstractInstanceRegistry#cancel(...)` 方法，下线应用实例信息。
@@ -622,11 +514,7 @@ public boolean cancel(final String appName, final String id, final boolean isRep
 - 调用 `Lease#cancel()` 方法，取消租约。
 
 ```java
-public void cancel() {
-    if (evictionTimestamp <= 0) {
-        evictionTimestamp = System.currentTimeMillis();
-    }
-}
+public void cancel() {    if (evictionTimestamp <= 0) {        evictionTimestamp = System.currentTimeMillis();    }}
 ```
 
 - 设置应用实例信息的操作类型为添加，并添加到最近租约变更记录队列( `recentlyChangedQueue` )。`recentlyChangedQueue` 用于注册信息的增量获取
@@ -637,41 +525,11 @@ public void cancel() {
 在`EurekaBootStrap#initEurekaServerContext()`在服务启动时会与别的Eureka节点进行注册信息同步，从别的Eureka节点同步注册信息。
 
 ```java
-// Copy registry from neighboring eureka node
-int registryCount = registry.syncUp();
+// Copy registry from neighboring eureka nodeint registryCount = registry.syncUp();
 ```
 
 ```java
-@Override
-public int syncUp() {
-    // Copy entire entry from neighboring DS node
-    int count = 0;
-
-    for (int i = 0; ((i < serverConfig.getRegistrySyncRetries()) && (count == 0)); i++) {
-        if (i > 0) {
-            try {
-                Thread.sleep(serverConfig.getRegistrySyncRetryWaitMs());
-            } catch (InterruptedException e) {
-                logger.warn("Interrupted during registry transfer..");
-                break;
-            }
-        }
-        Applications apps = eurekaClient.getApplications();
-        for (Application app : apps.getRegisteredApplications()) {
-            for (InstanceInfo instance : app.getInstances()) {
-                try {
-                    if (isRegisterable(instance)) {
-                        register(instance, instance.getLeaseInfo().getDurationInSecs(), true);
-                        count++;
-                    }
-                } catch (Throwable t) {
-                    logger.error("During DS init copy", t);
-                }
-            }
-        }
-    }
-    return count;
-}
+@Overridepublic int syncUp() {    // Copy entire entry from neighboring DS node    int count = 0;    for (int i = 0; ((i < serverConfig.getRegistrySyncRetries()) && (count == 0)); i++) {        if (i > 0) {            try {                Thread.sleep(serverConfig.getRegistrySyncRetryWaitMs());            } catch (InterruptedException e) {                logger.warn("Interrupted during registry transfer..");                break;            }        }        Applications apps = eurekaClient.getApplications();        for (Application app : apps.getRegisteredApplications()) {            for (InstanceInfo instance : app.getInstances()) {                try {                    if (isRegisterable(instance)) {                        register(instance, instance.getLeaseInfo().getDurationInSecs(), true);                        count++;                    }                } catch (Throwable t) {                    logger.error("During DS init copy", t);                }            }        }    }    return count;}
 ```
 
 Eureka在启动的时候会进行注册信息同步，一般只会同步一个节点，因为count肯定不是0了。整个逻辑如下：
@@ -682,92 +540,7 @@ Eureka在启动的时候会进行注册信息同步，一般只会同步一个�
 - 然后遍历应用信息看是否需要注册，如果需要注册就通过`register`方法注册到本地缓存中
 
 ```java
-public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {
-    read.lock();
-    try {
-        Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());
-        REGISTER.increment(isReplication);
-        if (gMap == null) {
-            final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();
-            gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);
-            if (gMap == null) {
-                gMap = gNewMap;
-            }
-        }
-        Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());
-        // Retain the last dirty timestamp without overwriting it, if there is already a lease
-        if (existingLease != null && (existingLease.getHolder() != null)) {
-            Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();
-            Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();
-            logger.debug("Existing lease found (existing={}, provided={}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
-
-            // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted
-            // InstanceInfo instead of the server local copy.
-            if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {
-                logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +
-                        " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);
-                logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");
-                registrant = existingLease.getHolder();
-            }
-        } else {
-            // The lease does not exist and hence it is a new registration
-            synchronized (lock) {
-                if (this.expectedNumberOfClientsSendingRenews > 0) {
-                    // Since the client wants to register it, increase the number of clients sending renews
-                    this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;
-                  //这里更新了一下自我保护的阈值  
-                  updateRenewsPerMinThreshold();
-                }
-            }
-            logger.debug("No previous lease information found; it is new registration");
-        }
-      //生成租约信息
-        Lease<InstanceInfo> lease = new Lease<InstanceInfo>(registrant, leaseDuration);
-        if (existingLease != null) {
-            lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());
-        }
-      //把注册信息放到缓存中
-        gMap.put(registrant.getId(), lease);
-      //加入到最近注册的Queue中
-        recentRegisteredQueue.add(new Pair<Long, String>(
-                System.currentTimeMillis(),
-                registrant.getAppName() + "(" + registrant.getId() + ")"));
-        // This is where the initial state transfer of overridden status happens
-        if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {
-            logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "
-                            + "overrides", registrant.getOverriddenStatus(), registrant.getId());
-            if (!overriddenInstanceStatusMap.containsKey(registrant.getId())) {
-                logger.info("Not found overridden id {} and hence adding it", registrant.getId());
-                overriddenInstanceStatusMap.put(registrant.getId(), registrant.getOverriddenStatus());
-            }
-        }
-        InstanceStatus overriddenStatusFromMap = overriddenInstanceStatusMap.get(registrant.getId());
-        if (overriddenStatusFromMap != null) {
-            logger.info("Storing overridden status {} from map", overriddenStatusFromMap);
-            registrant.setOverriddenStatus(overriddenStatusFromMap);
-        }
-
-        // Set the status based on the overridden status rules
-        InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);
-        registrant.setStatusWithoutDirty(overriddenInstanceStatus);
-
-        // If the lease is registered with UP status, set lease service up timestamp
-        if (InstanceStatus.UP.equals(registrant.getStatus())) {
-            lease.serviceUp();
-        }
-        registrant.setActionType(ActionType.ADDED);
-      //放到最近变化的Queue中
-        recentlyChangedQueue.add(new RecentlyChangedItem(lease));
-      //更改了最近注册的时间戳
-        registrant.setLastUpdatedTimestamp();
-      //过期自己的readWriteCacheMap
-        invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());
-        logger.info("Registered instance {}/{} with status {} (replication={})",
-                registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);
-    } finally {
-        read.unlock();
-    }
-}
+public void register(InstanceInfo registrant, int leaseDuration, boolean isReplication) {    read.lock();    try {        Map<String, Lease<InstanceInfo>> gMap = registry.get(registrant.getAppName());        REGISTER.increment(isReplication);        if (gMap == null) {            final ConcurrentHashMap<String, Lease<InstanceInfo>> gNewMap = new ConcurrentHashMap<String, Lease<InstanceInfo>>();            gMap = registry.putIfAbsent(registrant.getAppName(), gNewMap);            if (gMap == null) {                gMap = gNewMap;            }        }        Lease<InstanceInfo> existingLease = gMap.get(registrant.getId());        // Retain the last dirty timestamp without overwriting it, if there is already a lease        if (existingLease != null && (existingLease.getHolder() != null)) {            Long existingLastDirtyTimestamp = existingLease.getHolder().getLastDirtyTimestamp();            Long registrationLastDirtyTimestamp = registrant.getLastDirtyTimestamp();            logger.debug("Existing lease found (existing={}, provided={}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);            // this is a > instead of a >= because if the timestamps are equal, we still take the remote transmitted            // InstanceInfo instead of the server local copy.            if (existingLastDirtyTimestamp > registrationLastDirtyTimestamp) {                logger.warn("There is an existing lease and the existing lease's dirty timestamp {} is greater" +                        " than the one that is being registered {}", existingLastDirtyTimestamp, registrationLastDirtyTimestamp);                logger.warn("Using the existing instanceInfo instead of the new instanceInfo as the registrant");                registrant = existingLease.getHolder();            }        } else {            // The lease does not exist and hence it is a new registration            synchronized (lock) {                if (this.expectedNumberOfClientsSendingRenews > 0) {                    // Since the client wants to register it, increase the number of clients sending renews                    this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews + 1;                  //这里更新了一下自我保护的阈值                    updateRenewsPerMinThreshold();                }            }            logger.debug("No previous lease information found; it is new registration");        }      //生成租约信息        Lease<InstanceInfo> lease = new Lease<InstanceInfo>(registrant, leaseDuration);        if (existingLease != null) {            lease.setServiceUpTimestamp(existingLease.getServiceUpTimestamp());        }      //把注册信息放到缓存中        gMap.put(registrant.getId(), lease);      //加入到最近注册的Queue中        recentRegisteredQueue.add(new Pair<Long, String>(                System.currentTimeMillis(),                registrant.getAppName() + "(" + registrant.getId() + ")"));        // This is where the initial state transfer of overridden status happens        if (!InstanceStatus.UNKNOWN.equals(registrant.getOverriddenStatus())) {            logger.debug("Found overridden status {} for instance {}. Checking to see if needs to be add to the "                            + "overrides", registrant.getOverriddenStatus(), registrant.getId());            if (!overriddenInstanceStatusMap.containsKey(registrant.getId())) {                logger.info("Not found overridden id {} and hence adding it", registrant.getId());                overriddenInstanceStatusMap.put(registrant.getId(), registrant.getOverriddenStatus());            }        }        InstanceStatus overriddenStatusFromMap = overriddenInstanceStatusMap.get(registrant.getId());        if (overriddenStatusFromMap != null) {            logger.info("Storing overridden status {} from map", overriddenStatusFromMap);            registrant.setOverriddenStatus(overriddenStatusFromMap);        }        // Set the status based on the overridden status rules        InstanceStatus overriddenInstanceStatus = getOverriddenInstanceStatus(registrant, existingLease, isReplication);        registrant.setStatusWithoutDirty(overriddenInstanceStatus);        // If the lease is registered with UP status, set lease service up timestamp        if (InstanceStatus.UP.equals(registrant.getStatus())) {            lease.serviceUp();        }        registrant.setActionType(ActionType.ADDED);      //放到最近变化的Queue中        recentlyChangedQueue.add(new RecentlyChangedItem(lease));      //更改了最近注册的时间戳        registrant.setLastUpdatedTimestamp();      //过期自己的readWriteCacheMap        invalidateCache(registrant.getAppName(), registrant.getVIPAddress(), registrant.getSecureVipAddress());        logger.info("Registered instance {}/{} with status {} (replication={})",                registrant.getAppName(), registrant.getId(), registrant.getStatus(), isReplication);    } finally {        read.unlock();    }}
 ```
 
 具体逻辑看代码注释吧，不写了
@@ -781,200 +554,27 @@ registry.openForTraffic(applicationInfoManager, registryCount);
 不得不说Eureka这方法命名真的厉害，这特么openForTraffic什么鬼？
 
 ```java
-@Override
-public void openForTraffic(ApplicationInfoManager applicationInfoManager, int count) {
-    // Renewals happen every 30 seconds and for a minute it should be a factor of 2.
-    this.expectedNumberOfClientsSendingRenews = count;
-  //首先更新了一下自我保护的一个阈值
-    updateRenewsPerMinThreshold();
-    logger.info("Got {} instances from neighboring DS node", count);
-    logger.info("Renew threshold is: {}", numberOfRenewsPerMinThreshold);
-    this.startupTime = System.currentTimeMillis();
-    if (count > 0) {
-        this.peerInstancesTransferEmptyOnStartup = false;
-    }
-    DataCenterInfo.Name selfName = applicationInfoManager.getInfo().getDataCenterInfo().getName();
-  //处理一下AWS相关的逻辑，不细看了
-    boolean isAws = Name.Amazon == selfName;
-    if (isAws && serverConfig.shouldPrimeAwsReplicaConnections()) {
-        logger.info("Priming AWS connections for all replicas..");
-        primeAwsReplicas(applicationInfoManager);
-    }
-    logger.info("Changing status to UP");
-  //给自己的服务实例信息变更为UP，让别人可以看到
-    applicationInfoManager.setInstanceStatus(InstanceStatus.UP);
-  //最主要的方法，这里面启动了一个扫描过期注册信息的任务
-    super.postInit();
-}
+@Overridepublic void openForTraffic(ApplicationInfoManager applicationInfoManager, int count) {    // Renewals happen every 30 seconds and for a minute it should be a factor of 2.    this.expectedNumberOfClientsSendingRenews = count;  //首先更新了一下自我保护的一个阈值    updateRenewsPerMinThreshold();    logger.info("Got {} instances from neighboring DS node", count);    logger.info("Renew threshold is: {}", numberOfRenewsPerMinThreshold);    this.startupTime = System.currentTimeMillis();    if (count > 0) {        this.peerInstancesTransferEmptyOnStartup = false;    }    DataCenterInfo.Name selfName = applicationInfoManager.getInfo().getDataCenterInfo().getName();  //处理一下AWS相关的逻辑，不细看了    boolean isAws = Name.Amazon == selfName;    if (isAws && serverConfig.shouldPrimeAwsReplicaConnections()) {        logger.info("Priming AWS connections for all replicas..");        primeAwsReplicas(applicationInfoManager);    }    logger.info("Changing status to UP");  //给自己的服务实例信息变更为UP，让别人可以看到    applicationInfoManager.setInstanceStatus(InstanceStatus.UP);  //最主要的方法，这里面启动了一个扫描过期注册信息的任务    super.postInit();}
 ```
 
 ```java
-protected void postInit() {
-    renewsLastMin.start();
-    if (evictionTaskRef.get() != null) {
-        evictionTaskRef.get().cancel();
-    }
-    evictionTaskRef.set(new EvictionTask());
-    evictionTimer.schedule(evictionTaskRef.get(),
-            serverConfig.getEvictionIntervalTimerInMs(),
-            serverConfig.getEvictionIntervalTimerInMs());
-}
+protected void postInit() {    renewsLastMin.start();    if (evictionTaskRef.get() != null) {        evictionTaskRef.get().cancel();    }    evictionTaskRef.set(new EvictionTask());    evictionTimer.schedule(evictionTaskRef.get(),            serverConfig.getEvictionIntervalTimerInMs(),            serverConfig.getEvictionIntervalTimerInMs());}
 ```
 
 这里就是`openForTraffic`这个方法的执行重点了，其实就是启动了一个`new EvictionTask()`任务，并且延时60S执行，每60S执行一次。
 
 ```java
-@Override
-public void run() {
-    try {
-      //计算了一个补偿时间
-        long compensationTimeMs = getCompensationTimeMs();
-        logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);
-        evict(compensationTimeMs);
-    } catch (Throwable e) {
-        logger.error("Could not run the evict task", e);
-    }
-}
-
-/**
- * compute a compensation time defined as the actual time this task was executed since the prev iteration,
- * vs the configured amount of time for execution. This is useful for cases where changes in time (due to
- * clock skew or gc for example) causes the actual eviction task to execute later than the desired time
- * according to the configured cycle.
- */
-long getCompensationTimeMs() {
-    long currNanos = getCurrentTimeNano();
-    long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);
-    if (lastNanos == 0l) {
-        return 0l;
-    }
-
-    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(currNanos - lastNanos);
-    long compensationTime = elapsedMs - serverConfig.getEvictionIntervalTimerInMs();
-    return compensationTime <= 0l ? 0l : compensationTime;
-}
+@Overridepublic void run() {    try {      //计算了一个补偿时间        long compensationTimeMs = getCompensationTimeMs();        logger.info("Running the evict task with compensationTime {}ms", compensationTimeMs);        evict(compensationTimeMs);    } catch (Throwable e) {        logger.error("Could not run the evict task", e);    }}/** * compute a compensation time defined as the actual time this task was executed since the prev iteration, * vs the configured amount of time for execution. This is useful for cases where changes in time (due to * clock skew or gc for example) causes the actual eviction task to execute later than the desired time * according to the configured cycle. */long getCompensationTimeMs() {    long currNanos = getCurrentTimeNano();    long lastNanos = lastExecutionNanosRef.getAndSet(currNanos);    if (lastNanos == 0l) {        return 0l;    }    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(currNanos - lastNanos);    long compensationTime = elapsedMs - serverConfig.getEvictionIntervalTimerInMs();    return compensationTime <= 0l ? 0l : compensationTime;}
 ```
 
 在`EvictionTask()`任务中，首先计算了一个补偿时间，这个补偿时间的意思是服务由于Linux时钟偏移了或者GC停顿了导致程序计算过期服务时间的间隔变短了，比如30S执行一次，这时候GC停顿了15S，然后网络拥堵了15S，可能Eureka本身都还没有进行心跳检测，所以这时候把一些服务给判定为下线了是不合理的，这里就是计算一下补偿时间。把这部分时间考虑进去。然后带着补偿时间的`run()`方法执行了下面的方法。
 
 ```java
-public void evict(long additionalLeaseMs) {
-    logger.debug("Running the evict task");
-		
-  //判断是否是自我保护模式，如果是的话就不过期了，自我保护的详细代码写在下面了
-    if (!isLeaseExpirationEnabled()) {
-        logger.debug("DS: lease expiration is currently disabled.");
-        return;
-    }
-		
-  //这里就是说先把所有过期的注册信息都给取出来，
-    // We collect first all expired items, to evict them in random order. For large eviction sets,
-    // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,
-    // the impact should be evenly distributed across all applications.
-    List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();
-    for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {
-        Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();
-        if (leaseMap != null) {
-            for (Entry<String, Lease<InstanceInfo>> leaseEntry : leaseMap.entrySet()) {
-                Lease<InstanceInfo> lease = leaseEntry.getValue();
-                if (lease.isExpired(additionalLeaseMs) && lease.getHolder() != null) {
-                    expiredLeases.add(lease);
-                }
-            }
-        }
-    }
-		
-    // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for
-    // triggering self-preservation. Without that we would wipe out full registry.
-  //获取本地所有注册的实例数量
-    int registrySize = (int) getLocalRegistrySize();
-  //然后 * 0.85的阈值算出来一个注册阈值，这个值是用来计算最大过期数量的
-    int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());
-  //用注册服务数量 - 最大可以摘除的数量就是本次可以删除的数量
-    int evictionLimit = registrySize - registrySizeThreshold;
-		
-  //与过期数量比较选个最小值
-    int toEvict = Math.min(expiredLeases.size(), evictionLimit);
-    if (toEvict > 0) {
-        logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);
-			//这里随机选取进行摘除，为了让实例摘除均匀一些
-        Random random = new Random(System.currentTimeMillis());
-        for (int i = 0; i < toEvict; i++) {
-            // Pick a random item (Knuth shuffle algorithm)
-            int next = i + random.nextInt(expiredLeases.size() - i);
-            Collections.swap(expiredLeases, i, next);
-            Lease<InstanceInfo> lease = expiredLeases.get(i);
-
-            String appName = lease.getHolder().getAppName();
-            String id = lease.getHolder().getId();
-          //这里是监控打点
-            EXPIRED.increment();
-            logger.warn("DS: Registry: expired lease for {}/{}", appName, id);
-          //摘除服务实例的具体方法
-            internalCancel(appName, id, false);
-        }
-    }
-}
+public void evict(long additionalLeaseMs) {    logger.debug("Running the evict task");		  //判断是否是自我保护模式，如果是的话就不过期了，自我保护的详细代码写在下面了    if (!isLeaseExpirationEnabled()) {        logger.debug("DS: lease expiration is currently disabled.");        return;    }		  //这里就是说先把所有过期的注册信息都给取出来，    // We collect first all expired items, to evict them in random order. For large eviction sets,    // if we do not that, we might wipe out whole apps before self preservation kicks in. By randomizing it,    // the impact should be evenly distributed across all applications.    List<Lease<InstanceInfo>> expiredLeases = new ArrayList<>();    for (Entry<String, Map<String, Lease<InstanceInfo>>> groupEntry : registry.entrySet()) {        Map<String, Lease<InstanceInfo>> leaseMap = groupEntry.getValue();        if (leaseMap != null) {            for (Entry<String, Lease<InstanceInfo>> leaseEntry : leaseMap.entrySet()) {                Lease<InstanceInfo> lease = leaseEntry.getValue();                if (lease.isExpired(additionalLeaseMs) && lease.getHolder() != null) {                    expiredLeases.add(lease);                }            }        }    }		    // To compensate for GC pauses or drifting local time, we need to use current registry size as a base for    // triggering self-preservation. Without that we would wipe out full registry.  //获取本地所有注册的实例数量    int registrySize = (int) getLocalRegistrySize();  //然后 * 0.85的阈值算出来一个注册阈值，这个值是用来计算最大过期数量的    int registrySizeThreshold = (int) (registrySize * serverConfig.getRenewalPercentThreshold());  //用注册服务数量 - 最大可以摘除的数量就是本次可以删除的数量    int evictionLimit = registrySize - registrySizeThreshold;		  //与过期数量比较选个最小值    int toEvict = Math.min(expiredLeases.size(), evictionLimit);    if (toEvict > 0) {        logger.info("Evicting {} items (expired={}, evictionLimit={})", toEvict, expiredLeases.size(), evictionLimit);			//这里随机选取进行摘除，为了让实例摘除均匀一些        Random random = new Random(System.currentTimeMillis());        for (int i = 0; i < toEvict; i++) {            // Pick a random item (Knuth shuffle algorithm)            int next = i + random.nextInt(expiredLeases.size() - i);            Collections.swap(expiredLeases, i, next);            Lease<InstanceInfo> lease = expiredLeases.get(i);            String appName = lease.getHolder().getAppName();            String id = lease.getHolder().getId();          //这里是监控打点            EXPIRED.increment();            logger.warn("DS: Registry: expired lease for {}/{}", appName, id);          //摘除服务实例的具体方法            internalCancel(appName, id, false);        }    }}
 ```
 
 ```java
-protected boolean internalCancel(String appName, String id, boolean isReplication) {
-    read.lock();
-    try {
-      //这里是个监控打点
-        CANCEL.increment(isReplication);
-      //从本地缓存中摘除服务实例
-        Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);
-        Lease<InstanceInfo> leaseToCancel = null;
-        if (gMap != null) {
-            leaseToCancel = gMap.remove(id);
-        }
-      //将服务实例信息增加到recentCanceledQueue 中
-        recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));
-      
-      //这里我没弄明白是什么意思
-        InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);
-        if (instanceStatus != null) {
-            logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());
-        }
-        if (leaseToCancel == null) {
-            CANCEL_NOT_FOUND.increment(isReplication);
-            logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);
-            return false;
-        } else {
-            leaseToCancel.cancel();
-            InstanceInfo instanceInfo = leaseToCancel.getHolder();
-            String vip = null;
-            String svip = null;
-            if (instanceInfo != null) {
-              //这里设置一下服务的状态
-                instanceInfo.setActionType(ActionType.DELETED);
-              //增加到最近改变队列
-                recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));
-                instanceInfo.setLastUpdatedTimestamp();
-                vip = instanceInfo.getVIPAddress();
-                svip = instanceInfo.getSecureVipAddress();
-            }
-          
-          //刷新readWriteCache
-            invalidateCache(appName, vip, svip);
-            logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);
-        }
-    } finally {
-        read.unlock();
-    }
-
-    synchronized (lock) {
-        if (this.expectedNumberOfClientsSendingRenews > 0) {
-            // Since the client wants to cancel it, reduce the number of clients to send renews.
-          //这里减少一下注册服务的数量用于重新计算自我保护机制的阈值
-            this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews - 1;
-            updateRenewsPerMinThreshold();
-        }
-    }
-
-    return true;
-}
+protected boolean internalCancel(String appName, String id, boolean isReplication) {    read.lock();    try {      //这里是个监控打点        CANCEL.increment(isReplication);      //从本地缓存中摘除服务实例        Map<String, Lease<InstanceInfo>> gMap = registry.get(appName);        Lease<InstanceInfo> leaseToCancel = null;        if (gMap != null) {            leaseToCancel = gMap.remove(id);        }      //将服务实例信息增加到recentCanceledQueue 中        recentCanceledQueue.add(new Pair<Long, String>(System.currentTimeMillis(), appName + "(" + id + ")"));            //这里我没弄明白是什么意思        InstanceStatus instanceStatus = overriddenInstanceStatusMap.remove(id);        if (instanceStatus != null) {            logger.debug("Removed instance id {} from the overridden map which has value {}", id, instanceStatus.name());        }        if (leaseToCancel == null) {            CANCEL_NOT_FOUND.increment(isReplication);            logger.warn("DS: Registry: cancel failed because Lease is not registered for: {}/{}", appName, id);            return false;        } else {            leaseToCancel.cancel();            InstanceInfo instanceInfo = leaseToCancel.getHolder();            String vip = null;            String svip = null;            if (instanceInfo != null) {              //这里设置一下服务的状态                instanceInfo.setActionType(ActionType.DELETED);              //增加到最近改变队列                recentlyChangedQueue.add(new RecentlyChangedItem(leaseToCancel));                instanceInfo.setLastUpdatedTimestamp();                vip = instanceInfo.getVIPAddress();                svip = instanceInfo.getSecureVipAddress();            }                    //刷新readWriteCache            invalidateCache(appName, vip, svip);            logger.info("Cancelled instance {}/{} (replication={})", appName, id, isReplication);        }    } finally {        read.unlock();    }    synchronized (lock) {        if (this.expectedNumberOfClientsSendingRenews > 0) {            // Since the client wants to cancel it, reduce the number of clients to send renews.          //这里减少一下注册服务的数量用于重新计算自我保护机制的阈值            this.expectedNumberOfClientsSendingRenews = this.expectedNumberOfClientsSendingRenews - 1;            updateRenewsPerMinThreshold();        }    }    return true;}
 ```
 
 具体的逻辑在看上面的代码的注释吧，我发现直接在代码里写注释挺好的，其实比写大段的文字更加直观。以后我就都这么写了，而且还省事。捏哈哈哈
@@ -992,29 +592,15 @@ protected boolean internalCancel(String appName, String id, boolean isReplicatio
 > 在Spring Cloud中，可以使用`eureka.server.enable-self-preservation = false` 禁用自我保护模式。
 
 ```java
-@Override
-public boolean isLeaseExpirationEnabled() {
-    if (!isSelfPreservationModeEnabled()) {
-        // The self preservation mode is disabled, hence allowing the instances to expire.
-        return true;
-    }
-    return numberOfRenewsPerMinThreshold > 0 && getNumOfRenewsInLastMin() > numberOfRenewsPerMinThreshold;
-}
+@Overridepublic boolean isLeaseExpirationEnabled() {    if (!isSelfPreservationModeEnabled()) {        // The self preservation mode is disabled, hence allowing the instances to expire.        return true;    }    return numberOfRenewsPerMinThreshold > 0 && getNumOfRenewsInLastMin() > numberOfRenewsPerMinThreshold;}
 ```
 
 ```java
-protected void updateRenewsPerMinThreshold() {
-    this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews
-            * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())
-            * serverConfig.getRenewalPercentThreshold());
-}
+protected void updateRenewsPerMinThreshold() {    this.numberOfRenewsPerMinThreshold = (int) (this.expectedNumberOfClientsSendingRenews            * (60.0 / serverConfig.getExpectedClientRenewalIntervalSeconds())            * serverConfig.getRenewalPercentThreshold());}
 ```
 
 ```java
-@Override
-public long getNumOfRenewsInLastMin() {
-    return renewsLastMin.getCount();
-}
+@Overridepublic long getNumOfRenewsInLastMin() {    return renewsLastMin.getCount();}
 ```
 
 上面是有关自我保护的两段代码，首先`numberOfRenewsPerMinThreshold`就是每分钟期望的心跳数量，翻译一下计算逻辑就是Eureka中注册的实例数量 * 每分钟2次心跳 * 0.85的阈值就是这个数。
@@ -1055,187 +641,35 @@ Eureka-Server 集群通过任务批处理同步应用实例注册实例。
 在`EurekaBootStrap#initEurekaServerContext()`方法中,构建了`PeerEurekaNodes`这里面就是同步Eureka-Server集群信息。
 
 ```java
-PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(
-        registry,
-        eurekaServerConfig,
-        eurekaClient.getEurekaClientConfig(),
-        serverCodecs,
-        applicationInfoManager
-);
+PeerEurekaNodes peerEurekaNodes = getPeerEurekaNodes(        registry,        eurekaServerConfig,        eurekaClient.getEurekaClientConfig(),        serverCodecs,        applicationInfoManager);
 ```
 
 在`PeerEurekaNodes#start()`方法中进行了集群同步。
 
 ```java
-public void start() {
-  //启动一个单线程的线程池做任务执行线程
-    taskExecutor = Executors.newSingleThreadScheduledExecutor(
-            new ThreadFactory() {
-                @Override
-                public Thread newThread(Runnable r) {
-                    Thread thread = new Thread(r, "Eureka-PeerNodesUpdater");
-                    thread.setDaemon(true);
-                    return thread;
-                }
-            }
-    );
-    try {
-      //获取所有集群Url并且依次通过这些URL请求同步集群信息
-        updatePeerEurekaNodes(resolvePeerUrls());
-      //声明一个集群信息同步任务
-        Runnable peersUpdateTask = new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    updatePeerEurekaNodes(resolvePeerUrls());
-                } catch (Throwable e) {
-                    logger.error("Cannot update the replica Nodes", e);
-                }
-
-            }
-        };
-      //启动定时任务，每10分钟同步一次(10 * 60 * 1000) Eureka集群
-        taskExecutor.scheduleWithFixedDelay(
-                peersUpdateTask,
-                serverConfig.getPeerEurekaNodesUpdateIntervalMs(),
-                serverConfig.getPeerEurekaNodesUpdateIntervalMs(),
-                TimeUnit.MILLISECONDS
-        );
-    } catch (Exception e) {
-        throw new IllegalStateException(e);
-    }
-    for (PeerEurekaNode node : peerEurekaNodes) {
-        logger.info("Replica node URL:  {}", node.getServiceUrl());
-    }
-}
+public void start() {  //启动一个单线程的线程池做任务执行线程    taskExecutor = Executors.newSingleThreadScheduledExecutor(            new ThreadFactory() {                @Override                public Thread newThread(Runnable r) {                    Thread thread = new Thread(r, "Eureka-PeerNodesUpdater");                    thread.setDaemon(true);                    return thread;                }            }    );    try {      //获取所有集群Url并且依次通过这些URL请求同步集群信息        updatePeerEurekaNodes(resolvePeerUrls());      //声明一个集群信息同步任务        Runnable peersUpdateTask = new Runnable() {            @Override            public void run() {                try {                    updatePeerEurekaNodes(resolvePeerUrls());                } catch (Throwable e) {                    logger.error("Cannot update the replica Nodes", e);                }            }        };      //启动定时任务，每10分钟同步一次(10 * 60 * 1000) Eureka集群        taskExecutor.scheduleWithFixedDelay(                peersUpdateTask,                serverConfig.getPeerEurekaNodesUpdateIntervalMs(),                serverConfig.getPeerEurekaNodesUpdateIntervalMs(),                TimeUnit.MILLISECONDS        );    } catch (Exception e) {        throw new IllegalStateException(e);    }    for (PeerEurekaNode node : peerEurekaNodes) {        logger.info("Replica node URL:  {}", node.getServiceUrl());    }}
 ```
 
 下面开始对上面的代码中的一些方法进行详细的解析,在`resolvePeerUrls()`方法中获取了所有的Eureka机器Url
 
 ```java
-protected List<String> resolvePeerUrls() {
-  //从ApplicationInfoManager中获取自己的实例信息
-    InstanceInfo myInfo = applicationInfoManager.getInfo();
-    String zone = InstanceInfo.getZone(clientConfig.getAvailabilityZones(clientConfig.getRegion()), myInfo);
-  //这里就获取了所有的Eureka集群信息，其实就是从配置文件中读取了所有的serverUrl，用逗号分隔的  
-  List<String> replicaUrls = EndpointUtils
-            .getDiscoveryServiceUrls(clientConfig, zone, new EndpointUtils.InstanceInfoBasedUrlRandomizer(myInfo));
-
-    int idx = 0;
-  //这里把自己从同步信息里去掉，不用同步自己的信息
-    while (idx < replicaUrls.size()) {
-        if (isThisMyUrl(replicaUrls.get(idx))) {
-            replicaUrls.remove(idx);
-        } else {
-            idx++;
-        }
-    }
-    return replicaUrls;
-}
+protected List<String> resolvePeerUrls() {  //从ApplicationInfoManager中获取自己的实例信息    InstanceInfo myInfo = applicationInfoManager.getInfo();    String zone = InstanceInfo.getZone(clientConfig.getAvailabilityZones(clientConfig.getRegion()), myInfo);  //这里就获取了所有的Eureka集群信息，其实就是从配置文件中读取了所有的serverUrl，用逗号分隔的    List<String> replicaUrls = EndpointUtils            .getDiscoveryServiceUrls(clientConfig, zone, new EndpointUtils.InstanceInfoBasedUrlRandomizer(myInfo));    int idx = 0;  //这里把自己从同步信息里去掉，不用同步自己的信息    while (idx < replicaUrls.size()) {        if (isThisMyUrl(replicaUrls.get(idx))) {            replicaUrls.remove(idx);        } else {            idx++;        }    }    return replicaUrls;}
 ```
 
 在`updatePeerEurekaNodes`方法中创建了集群实例`PeerEurekaNode`，并且做了一些`PeerEurekaNode`的初始化工作，创建了一下批量任务执行器等操作
 
 ```java
-protected void updatePeerEurekaNodes(List<String> newPeerUrls) {
-    if (newPeerUrls.isEmpty()) {
-        logger.warn("The replica size seems to be empty. Check the route 53 DNS Registry");
-        return;
-    }
-		//下面这一些逻辑没弄太懂，有一些URL不会进行同步
-    Set<String> toShutdown = new HashSet<>(peerEurekaNodeUrls);
-    toShutdown.removeAll(newPeerUrls);
-    Set<String> toAdd = new HashSet<>(newPeerUrls);
-    toAdd.removeAll(peerEurekaNodeUrls);
-
-    if (toShutdown.isEmpty() && toAdd.isEmpty()) { // No change
-        return;
-    }
-
-    // Remove peers no long available
-    List<PeerEurekaNode> newNodeList = new ArrayList<>(peerEurekaNodes);
-
-    if (!toShutdown.isEmpty()) {
-        logger.info("Removing no longer available peer nodes {}", toShutdown);
-        int i = 0;
-        while (i < newNodeList.size()) {
-            PeerEurekaNode eurekaNode = newNodeList.get(i);
-            if (toShutdown.contains(eurekaNode.getServiceUrl())) {
-                newNodeList.remove(i);
-                eurekaNode.shutDown();
-            } else {
-                i++;
-            }
-        }
-    }
-
-    // Add new peers
-    if (!toAdd.isEmpty()) {
-        logger.info("Adding new peer nodes {}", toAdd);
-        for (String peerUrl : toAdd) {
-          //这里创建了一个PeerEurekaNode节点
-            newNodeList.add(createPeerEurekaNode(peerUrl));
-        }
-    }
-
-    this.peerEurekaNodes = newNodeList;
-    this.peerEurekaNodeUrls = new HashSet<>(newPeerUrls);
-}
+protected void updatePeerEurekaNodes(List<String> newPeerUrls) {    if (newPeerUrls.isEmpty()) {        logger.warn("The replica size seems to be empty. Check the route 53 DNS Registry");        return;    }		//下面这一些逻辑没弄太懂，有一些URL不会进行同步    Set<String> toShutdown = new HashSet<>(peerEurekaNodeUrls);    toShutdown.removeAll(newPeerUrls);    Set<String> toAdd = new HashSet<>(newPeerUrls);    toAdd.removeAll(peerEurekaNodeUrls);    if (toShutdown.isEmpty() && toAdd.isEmpty()) { // No change        return;    }    // Remove peers no long available    List<PeerEurekaNode> newNodeList = new ArrayList<>(peerEurekaNodes);    if (!toShutdown.isEmpty()) {        logger.info("Removing no longer available peer nodes {}", toShutdown);        int i = 0;        while (i < newNodeList.size()) {            PeerEurekaNode eurekaNode = newNodeList.get(i);            if (toShutdown.contains(eurekaNode.getServiceUrl())) {                newNodeList.remove(i);                eurekaNode.shutDown();            } else {                i++;            }        }    }    // Add new peers    if (!toAdd.isEmpty()) {        logger.info("Adding new peer nodes {}", toAdd);        for (String peerUrl : toAdd) {          //这里创建了一个PeerEurekaNode节点            newNodeList.add(createPeerEurekaNode(peerUrl));        }    }    this.peerEurekaNodes = newNodeList;    this.peerEurekaNodeUrls = new HashSet<>(newPeerUrls);}
 ```
 
 在`createPeerEurekaNode()`进行了Eureka集群节点信息同步，并且进行了相关初始化。
 
 ```java
-protected PeerEurekaNode createPeerEurekaNode(String peerEurekaNodeUrl) {
-  //这里明显初始化了一个Http客户端，用于后面与其他Client进行节点信息同步的
-    HttpReplicationClient replicationClient = JerseyReplicationClient.createReplicationClient(serverConfig, serverCodecs, peerEurekaNodeUrl);
-    String targetHost = hostFromUrl(peerEurekaNodeUrl);
-    if (targetHost == null) {
-        targetHost = "host";
-    }
-  //创建了一个PeerEurekaNode节点，并完成初始化
-    return new PeerEurekaNode(registry, targetHost, peerEurekaNodeUrl, replicationClient, serverConfig);
-}
+protected PeerEurekaNode createPeerEurekaNode(String peerEurekaNodeUrl) {  //这里明显初始化了一个Http客户端，用于后面与其他Client进行节点信息同步的    HttpReplicationClient replicationClient = JerseyReplicationClient.createReplicationClient(serverConfig, serverCodecs, peerEurekaNodeUrl);    String targetHost = hostFromUrl(peerEurekaNodeUrl);    if (targetHost == null) {        targetHost = "host";    }  //创建了一个PeerEurekaNode节点，并完成初始化    return new PeerEurekaNode(registry, targetHost, peerEurekaNodeUrl, replicationClient, serverConfig);}
 ```
 
 ```java
-PeerEurekaNode(PeerAwareInstanceRegistry registry, String targetHost, String serviceUrl,
-                                 HttpReplicationClient replicationClient, EurekaServerConfig config,
-                                 int batchSize, long maxBatchingDelayMs,
-                                 long retrySleepTimeMs, long serverUnavailableSleepTimeMs) {
-    this.registry = registry;
-    this.targetHost = targetHost;
-    this.replicationClient = replicationClient;
-
-    this.serviceUrl = serviceUrl;
-    this.config = config;
-    this.maxProcessingDelayMs = config.getMaxTimeForReplication();
-		
-  //下面创建了跟批量任务处理相关的东西
-    String batcherName = getBatcherName();
-    ReplicationTaskProcessor taskProcessor = new ReplicationTaskProcessor(targetHost, replicationClient);
-  //批量任务分发器 
-  this.batchingDispatcher = TaskDispatchers.createBatchingTaskDispatcher(
-            batcherName,
-            config.getMaxElementsInPeerReplicationPool(),
-            batchSize,
-            config.getMaxThreadsForPeerReplication(),
-            maxBatchingDelayMs,
-            serverUnavailableSleepTimeMs,
-            retrySleepTimeMs,
-            taskProcessor
-    );
-  //单任务分发器
-    this.nonBatchingDispatcher = TaskDispatchers.createNonBatchingTaskDispatcher(
-            targetHost,
-            config.getMaxElementsInStatusReplicationPool(),
-            config.getMaxThreadsForStatusReplication(),
-            maxBatchingDelayMs,
-            serverUnavailableSleepTimeMs,
-            retrySleepTimeMs,
-            taskProcessor
-    );
-}
+PeerEurekaNode(PeerAwareInstanceRegistry registry, String targetHost, String serviceUrl,                                 HttpReplicationClient replicationClient, EurekaServerConfig config,                                 int batchSize, long maxBatchingDelayMs,                                 long retrySleepTimeMs, long serverUnavailableSleepTimeMs) {    this.registry = registry;    this.targetHost = targetHost;    this.replicationClient = replicationClient;    this.serviceUrl = serviceUrl;    this.config = config;    this.maxProcessingDelayMs = config.getMaxTimeForReplication();		  //下面创建了跟批量任务处理相关的东西    String batcherName = getBatcherName();    ReplicationTaskProcessor taskProcessor = new ReplicationTaskProcessor(targetHost, replicationClient);  //批量任务分发器   this.batchingDispatcher = TaskDispatchers.createBatchingTaskDispatcher(            batcherName,            config.getMaxElementsInPeerReplicationPool(),            batchSize,            config.getMaxThreadsForPeerReplication(),            maxBatchingDelayMs,            serverUnavailableSleepTimeMs,            retrySleepTimeMs,            taskProcessor    );  //单任务分发器    this.nonBatchingDispatcher = TaskDispatchers.createNonBatchingTaskDispatcher(            targetHost,            config.getMaxElementsInStatusReplicationPool(),            config.getMaxThreadsForStatusReplication(),            maxBatchingDelayMs,            serverUnavailableSleepTimeMs,            retrySleepTimeMs,            taskProcessor    );}
 ```
 
 ### Eureka同步注册信息
@@ -1251,138 +685,29 @@ PeerEurekaNode(PeerAwareInstanceRegistry registry, String targetHost, String ser
 - `PeerAwareInstanceRegistryImpl#deleteStatusOverride()`这我都不知道是干嘛的
 
 ```java
-private void replicateToPeers(Action action, String appName, String id,
-                              InstanceInfo info /* optional */,
-                              InstanceStatus newStatus /* optional */, boolean isReplication) {
-    Stopwatch tracer = action.getTimer().start();
-    try {
-      //增加一个统计
-        if (isReplication) {
-            numberOfReplicationsLastMin.increment();
-        }
-      //看是否是同步，如果是同步就不给自己同步了
-        // If it is a replication already, do not replicate again as this will create a poison replication
-        if (peerEurekaNodes == Collections.EMPTY_LIST || isReplication) {
-            return;
-        }
-			
-     //遍历每个同步节点PeerEurekaNode，向每个节点同步变化信息
-        for (final PeerEurekaNode node : peerEurekaNodes.getPeerEurekaNodes()) {
-            // If the url represents this host, do not replicate to yourself.
-            if (peerEurekaNodes.isThisMyUrl(node.getServiceUrl())) {
-                continue;
-            }
-          //执行同步任务，详情见下面的源码
-            replicateInstanceActionsToPeers(action, appName, id, info, newStatus, node);
-        }
-    } finally {
-        tracer.stop();
-    }
-}
+private void replicateToPeers(Action action, String appName, String id,                              InstanceInfo info /* optional */,                              InstanceStatus newStatus /* optional */, boolean isReplication) {    Stopwatch tracer = action.getTimer().start();    try {      //增加一个统计        if (isReplication) {            numberOfReplicationsLastMin.increment();        }      //看是否是同步，如果是同步就不给自己同步了        // If it is a replication already, do not replicate again as this will create a poison replication        if (peerEurekaNodes == Collections.EMPTY_LIST || isReplication) {            return;        }			     //遍历每个同步节点PeerEurekaNode，向每个节点同步变化信息        for (final PeerEurekaNode node : peerEurekaNodes.getPeerEurekaNodes()) {            // If the url represents this host, do not replicate to yourself.            if (peerEurekaNodes.isThisMyUrl(node.getServiceUrl())) {                continue;            }          //执行同步任务，详情见下面的源码            replicateInstanceActionsToPeers(action, appName, id, info, newStatus, node);        }    } finally {        tracer.stop();    }}
 ```
 
 ```java
-private void replicateInstanceActionsToPeers(Action action, String appName,
-                                             String id, InstanceInfo info, InstanceStatus newStatus,
-                                             PeerEurekaNode node) {
-    try {
-        InstanceInfo infoFromRegistry;
-        CurrentRequestVersion.set(Version.V2);
-      //根据不同的action执行不同的逻辑，具体都干嘛了呢，其实就是创建了一个相对应的批量任务扔到队列里去执行
-        switch (action) {
-            case Cancel:
-                node.cancel(appName, id);
-                break;
-            case Heartbeat:
-                InstanceStatus overriddenStatus = overriddenInstanceStatusMap.get(id);
-                infoFromRegistry = getInstanceByAppAndId(appName, id, false);
-                node.heartbeat(appName, id, infoFromRegistry, overriddenStatus, false);
-                break;
-            case Register:
-                node.register(info);
-                break;
-            case StatusUpdate:
-                infoFromRegistry = getInstanceByAppAndId(appName, id, false);
-                node.statusUpdate(appName, id, newStatus, infoFromRegistry);
-                break;
-            case DeleteStatusOverride:
-                infoFromRegistry = getInstanceByAppAndId(appName, id, false);
-                node.deleteStatusOverride(appName, id, infoFromRegistry);
-                break;
-        }
-    } catch (Throwable t) {
-        logger.error("Cannot replicate information to {} for action {}", node.getServiceUrl(), action.name(), t);
-    } finally {
-        CurrentRequestVersion.remove();
-    }
-}
+private void replicateInstanceActionsToPeers(Action action, String appName,                                             String id, InstanceInfo info, InstanceStatus newStatus,                                             PeerEurekaNode node) {    try {        InstanceInfo infoFromRegistry;        CurrentRequestVersion.set(Version.V2);      //根据不同的action执行不同的逻辑，具体都干嘛了呢，其实就是创建了一个相对应的批量任务扔到队列里去执行        switch (action) {            case Cancel:                node.cancel(appName, id);                break;            case Heartbeat:                InstanceStatus overriddenStatus = overriddenInstanceStatusMap.get(id);                infoFromRegistry = getInstanceByAppAndId(appName, id, false);                node.heartbeat(appName, id, infoFromRegistry, overriddenStatus, false);                break;            case Register:                node.register(info);                break;            case StatusUpdate:                infoFromRegistry = getInstanceByAppAndId(appName, id, false);                node.statusUpdate(appName, id, newStatus, infoFromRegistry);                break;            case DeleteStatusOverride:                infoFromRegistry = getInstanceByAppAndId(appName, id, false);                node.deleteStatusOverride(appName, id, infoFromRegistry);                break;        }    } catch (Throwable t) {        logger.error("Cannot replicate information to {} for action {}", node.getServiceUrl(), action.name(), t);    } finally {        CurrentRequestVersion.remove();    }}
 ```
 
 随便找一个以Cancel为例
 
 ```java
-public void cancel(final String appName, final String id) throws Exception {
-    long expiryTime = System.currentTimeMillis() + maxProcessingDelayMs;
-    batchingDispatcher.process(
-            taskId("cancel", appName, id),
-      //注意这里实现了InstanceReplicationTask的execute方法
-            new InstanceReplicationTask(targetHost, Action.Cancel, appName, id) {
-                @Override
-                public EurekaHttpResponse<Void> execute() {
-                  //执行具体操作
-                    return replicationClient.cancel(appName, id);
-                }
-
-                @Override
-                public void handleFailure(int statusCode, Object responseEntity) throws Throwable {
-                    super.handleFailure(statusCode, responseEntity);
-                    if (statusCode == 404) {
-                        logger.warn("{}: missing entry.", getTaskName());
-                    }
-                }
-            },
-            expiryTime
-    );
-}
+public void cancel(final String appName, final String id) throws Exception {    long expiryTime = System.currentTimeMillis() + maxProcessingDelayMs;    batchingDispatcher.process(            taskId("cancel", appName, id),      //注意这里实现了InstanceReplicationTask的execute方法            new InstanceReplicationTask(targetHost, Action.Cancel, appName, id) {                @Override                public EurekaHttpResponse<Void> execute() {                  //执行具体操作                    return replicationClient.cancel(appName, id);                }                @Override                public void handleFailure(int statusCode, Object responseEntity) throws Throwable {                    super.handleFailure(statusCode, responseEntity);                    if (statusCode == 404) {                        logger.warn("{}: missing entry.", getTaskName());                    }                }            },            expiryTime    );}
 ```
 
 所有的任务都实现了`InstanceReplicationTask#execute`方法，里面写了具体的操作，比如Cancel就是调用Eureka-Client执行了cancel逻辑。`batchingDispatcher.process`最终就会把任务扔到acceptorQueue任务队列里去
 
 ```java
-void process(ID id, T task, long expiryTime) {
-    acceptorQueue.add(new TaskHolder<ID, T>(id, task, expiryTime));
-    acceptedTasks++;
-}
+void process(ID id, T task, long expiryTime) {    acceptorQueue.add(new TaskHolder<ID, T>(id, task, expiryTime));    acceptedTasks++;}
 ```
 
 批量任务的处理逻辑在`ReplicationTaskProcessor#process()`方法中
 
 ```java
-@Override
-public ProcessingResult process(List<ReplicationTask> tasks) {
-    ReplicationList list = createReplicationListOf(tasks);
-    try {
-      //其实就是调用了一个批量提交任务的app
-        EurekaHttpResponse<ReplicationListResponse> response = replicationClient.submitBatchUpdates(list);
-        int statusCode = response.getStatusCode();
-        if (!isSuccess(statusCode)) {
-            if (statusCode == 503) {
-                logger.warn("Server busy (503) HTTP status code received from the peer {}; rescheduling tasks after delay", peerId);
-                return ProcessingResult.Congestion;
-            } else {
-                // Unexpected error returned from the server. This should ideally never happen.
-                logger.error("Batch update failure with HTTP status code {}; discarding {} replication tasks", statusCode, tasks.size());
-                return ProcessingResult.PermanentError;
-            }
-        } else {
-          //批量处理批量请求
-            handleBatchResponse(tasks, response.getEntity().getResponseList());
-        }
-    } catch (Throwable e) {
-      ...省略一些异常代码
-    }
-    return ProcessingResult.Success;
-}
+@Overridepublic ProcessingResult process(List<ReplicationTask> tasks) {    ReplicationList list = createReplicationListOf(tasks);    try {      //其实就是调用了一个批量提交任务的app        EurekaHttpResponse<ReplicationListResponse> response = replicationClient.submitBatchUpdates(list);        int statusCode = response.getStatusCode();        if (!isSuccess(statusCode)) {            if (statusCode == 503) {                logger.warn("Server busy (503) HTTP status code received from the peer {}; rescheduling tasks after delay", peerId);                return ProcessingResult.Congestion;            } else {                // Unexpected error returned from the server. This should ideally never happen.                logger.error("Batch update failure with HTTP status code {}; discarding {} replication tasks", statusCode, tasks.size());                return ProcessingResult.PermanentError;            }        } else {          //批量处理批量请求            handleBatchResponse(tasks, response.getEntity().getResponseList());        }    } catch (Throwable e) {      ...省略一些异常代码    }    return ProcessingResult.Success;}
 ```
 
 ### 批量处理同步任务
@@ -1390,57 +715,7 @@ public ProcessingResult process(List<ReplicationTask> tasks) {
 Eureka-Server处理批量同步任务的逻辑在`PeerReplicationResource#batchReplication()`方法中
 
 ```java
-@Path("batch")
-@POST
-public Response batchReplication(ReplicationList replicationList) {
-    try {
-        ReplicationListResponse batchResponse = new ReplicationListResponse();
-        for (ReplicationInstance instanceInfo : replicationList.getReplicationList()) {
-            try {
-              //逐个同步任务依次处理并将结果放到ReplicationListResponse中
-                batchResponse.addResponse(dispatch(instanceInfo));
-            } catch (Exception e) {
-                batchResponse.addResponse(new ReplicationInstanceResponse(Status.INTERNAL_SERVER_ERROR.getStatusCode(), null));
-                logger.error("{} request processing failed for batch item {}/{}",
-                        instanceInfo.getAction(), instanceInfo.getAppName(), instanceInfo.getId(), e);
-            }
-        }
-        return Response.ok(batchResponse).build();
-    } catch (Throwable e) {
-        logger.error("Cannot execute batch Request", e);
-        return Response.status(Status.INTERNAL_SERVER_ERROR).build();
-    }
-}
-
-private ReplicationInstanceResponse dispatch(ReplicationInstance instanceInfo) {
-    ApplicationResource applicationResource = createApplicationResource(instanceInfo);
-    InstanceResource resource = createInstanceResource(instanceInfo, applicationResource);
-
-    String lastDirtyTimestamp = toString(instanceInfo.getLastDirtyTimestamp());
-    String overriddenStatus = toString(instanceInfo.getOverriddenStatus());
-    String instanceStatus = toString(instanceInfo.getStatus());
-
-    Builder singleResponseBuilder = new Builder();
-  //依次处理每种任务类型，具体的处理逻辑就是我们之前看到的各种方法
-    switch (instanceInfo.getAction()) {
-        case Register:
-            singleResponseBuilder = handleRegister(instanceInfo, applicationResource);
-            break;
-        case Heartbeat:
-            singleResponseBuilder = handleHeartbeat(serverConfig, resource, lastDirtyTimestamp, overriddenStatus, instanceStatus);
-            break;
-        case Cancel:
-            singleResponseBuilder = handleCancel(resource);
-            break;
-        case StatusUpdate:
-            singleResponseBuilder = handleStatusUpdate(instanceInfo, resource);
-            break;
-        case DeleteStatusOverride:
-            singleResponseBuilder = handleDeleteStatusOverride(instanceInfo, resource);
-            break;
-    }
-    return singleResponseBuilder.build();
-}
+@Path("batch")@POSTpublic Response batchReplication(ReplicationList replicationList) {    try {        ReplicationListResponse batchResponse = new ReplicationListResponse();        for (ReplicationInstance instanceInfo : replicationList.getReplicationList()) {            try {              //逐个同步任务依次处理并将结果放到ReplicationListResponse中                batchResponse.addResponse(dispatch(instanceInfo));            } catch (Exception e) {                batchResponse.addResponse(new ReplicationInstanceResponse(Status.INTERNAL_SERVER_ERROR.getStatusCode(), null));                logger.error("{} request processing failed for batch item {}/{}",                        instanceInfo.getAction(), instanceInfo.getAppName(), instanceInfo.getId(), e);            }        }        return Response.ok(batchResponse).build();    } catch (Throwable e) {        logger.error("Cannot execute batch Request", e);        return Response.status(Status.INTERNAL_SERVER_ERROR).build();    }}private ReplicationInstanceResponse dispatch(ReplicationInstance instanceInfo) {    ApplicationResource applicationResource = createApplicationResource(instanceInfo);    InstanceResource resource = createInstanceResource(instanceInfo, applicationResource);    String lastDirtyTimestamp = toString(instanceInfo.getLastDirtyTimestamp());    String overriddenStatus = toString(instanceInfo.getOverriddenStatus());    String instanceStatus = toString(instanceInfo.getStatus());    Builder singleResponseBuilder = new Builder();  //依次处理每种任务类型，具体的处理逻辑就是我们之前看到的各种方法    switch (instanceInfo.getAction()) {        case Register:            singleResponseBuilder = handleRegister(instanceInfo, applicationResource);            break;        case Heartbeat:            singleResponseBuilder = handleHeartbeat(serverConfig, resource, lastDirtyTimestamp, overriddenStatus, instanceStatus);            break;        case Cancel:            singleResponseBuilder = handleCancel(resource);            break;        case StatusUpdate:            singleResponseBuilder = handleStatusUpdate(instanceInfo, resource);            break;        case DeleteStatusOverride:            singleResponseBuilder = handleDeleteStatusOverride(instanceInfo, resource);            break;    }    return singleResponseBuilder.build();}
 ```
 
 `dispatch`中负责处理不同类型的任务，以Register任务为例，最终底层调用了`ApplicationResource#addInstance`方法。
@@ -1448,31 +723,7 @@ private ReplicationInstanceResponse dispatch(ReplicationInstance instanceInfo) {
 当批量任务都处理完之后，会把处理结果返回给发送方，发送方收到结果后会在`ReplicationTaskProcessor#process()`中进行处理。具体的处理逻辑在`ReplicationTaskProcessor#handleBatchResponse`方法中
 
 ```java
-private void handleBatchResponse(List<ReplicationTask> tasks, List<ReplicationInstanceResponse> responseList) {
-    if (tasks.size() != responseList.size()) {
-        // This should ideally never happen unless there is a bug in the software.
-        logger.error("Batch response size different from submitted task list ({} != {}); skipping response analysis", responseList.size(), tasks.size());
-        return;
-    }
-    for (int i = 0; i < tasks.size(); i++) {
-        handleBatchResponse(tasks.get(i), responseList.get(i));
-    }
-}
-
-private void handleBatchResponse(ReplicationTask task, ReplicationInstanceResponse response) {
-    int statusCode = response.getStatusCode();
-  //处理成功情况  
-  if (isSuccess(statusCode)) {
-        task.handleSuccess();
-        return;
-    }
-  //处理失败情况
-    try {
-        task.handleFailure(response.getStatusCode(), response.getResponseEntity());
-    } catch (Throwable e) {
-        logger.error("Replication task {} error handler failure", task.getTaskName(), e);
-    }
-}
+private void handleBatchResponse(List<ReplicationTask> tasks, List<ReplicationInstanceResponse> responseList) {    if (tasks.size() != responseList.size()) {        // This should ideally never happen unless there is a bug in the software.        logger.error("Batch response size different from submitted task list ({} != {}); skipping response analysis", responseList.size(), tasks.size());        return;    }    for (int i = 0; i < tasks.size(); i++) {        handleBatchResponse(tasks.get(i), responseList.get(i));    }}private void handleBatchResponse(ReplicationTask task, ReplicationInstanceResponse response) {    int statusCode = response.getStatusCode();  //处理成功情况    if (isSuccess(statusCode)) {        task.handleSuccess();        return;    }  //处理失败情况    try {        task.handleFailure(response.getStatusCode(), response.getResponseEntity());    } catch (Throwable e) {        logger.error("Replication task {} error handler failure", task.getTaskName(), e);    }}
 ```
 
 下面引入一段我觉得比较好的对于Eureka集群同步的分析
@@ -1494,24 +745,7 @@ private void handleBatchResponse(ReplicationTask task, ReplicationInstanceRespon
 > 请求方接收到 404 状态码返回后，**认为 Eureka-Server 应用实例实际是不存在的**，重新发起应用实例的注册。以本文的 Heartbeat 为例子，代码如下：
 >
 > ```
-> // PeerEurekaNode#heartbeat(...)
->   1: @Override
->   2: public void handleFailure(int statusCode, Object responseEntity) throws Throwable {
->   3:     super.handleFailure(statusCode, responseEntity);
->   4:     if (statusCode == 404) {
->   5:         logger.warn("{}: missing entry.", getTaskName());
->   6:         if (info != null) {
->   7:             logger.warn("{}: cannot find instance id {} and hence replicating the instance with status {}",
->   8:                     getTaskName(), info.getId(), info.getStatus());
->   9:             register(info);
->  10:         }
->  11:     } else if (config.shouldSyncWhenTimestampDiffers()) {
->  12:         InstanceInfo peerInstanceInfo = (InstanceInfo) responseEntity;
->  13:         if (peerInstanceInfo != null) {
->  14:             syncInstancesIfTimestampDiffers(appName, id, info, peerInstanceInfo);
->  15:         }
->  16:     }
->  17: }
+> // PeerEurekaNode#heartbeat(...)  1: @Override  2: public void handleFailure(int statusCode, Object responseEntity) throws Throwable {  3:     super.handleFailure(statusCode, responseEntity);  4:     if (statusCode == 404) {  5:         logger.warn("{}: missing entry.", getTaskName());  6:         if (info != null) {  7:             logger.warn("{}: cannot find instance id {} and hence replicating the instance with status {}",  8:                     getTaskName(), info.getId(), info.getStatus());  9:             register(info); 10:         } 11:     } else if (config.shouldSyncWhenTimestampDiffers()) { 12:         InstanceInfo peerInstanceInfo = (InstanceInfo) responseEntity; 13:         if (peerInstanceInfo != null) { 14:             syncInstancesIfTimestampDiffers(appName, id, info, peerInstanceInfo); 15:         } 16:     } 17: }
 > ```
 >
 > - 第 4 至 10 行 ：接收到 404 状态码，调用 `#register(...)` 方法，向该被心跳同步操作失败的 Eureka-Server 发起注册**本地的应用实例**的请求。
