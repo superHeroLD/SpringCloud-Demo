@@ -38,7 +38,7 @@ Feign客户端：LoadBalancerFeignClient 跟Ribbon整合在一起使用的
 
 ### FeignClient自动装配
 
-在使用`EnableFeignClients`注解启用Feign后，在`EnableFeignClients`注解中会引入`FeignClientsRegistrar`类,这个类就是负责将我们使用`@FeignClient`注解标注的接口注入到Spring中。
+在使用`EnableFeignClients`注解启用Feign后，在`EnableFeignClients`注解中会引入`FeignClientsRegistrar`类,这个类就是负责将我们使用`@FeignClient`注解标注的接口注入到Spring中
 
 ```java
 @Retention(RetentionPolicy.RUNTIME)
