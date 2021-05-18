@@ -55,14 +55,14 @@ initEurekaServerContext()方法中，EurekaServerConfig eurekaServerConfig = new
 >  ```java
 >  static volatile AbstractConfiguration instance = null;
 >  public static AbstractConfiguration getConfigInstance() {
->      if (instance == null) {
->          synchronized (ConfigurationManager.class) {
->              if (instance == null) {
->                  instance = getConfigInstance(Boolean.getBoolean(DynamicPropertyFactory.DISABLE_DEFAULT_CONFIG));
->              }
->          }
->      }
->      return instance;
+>    if (instance == null) {
+>        synchronized (ConfigurationManager.class) {
+>            if (instance == null) {
+>                instance = getConfigInstance(Boolean.getBoolean(DynamicPropertyFactory.DISABLE_DEFAULT_CONFIG));
+>            }
+>        }
+>    }
+>    return instance;
 >  }
 >  ```
 
@@ -286,6 +286,22 @@ InstanceInfo的status改变发生在调用 `ApplicationInfoManager#setInstanceSt
 - 修改了一些租约信息什么的
 - **最终把实例信息放入了Map<String, Lease<InstanceInfo>>  gMap中**
 - 还有很重要的一点就是`invalidateCache()`方法清除本地缓存readWriteCacheMap
+
+下面列一下Lease类的一些代码
+
+```java
+public static final int DEFAULT_DURATION_IN_SECS = 90;
+
+private T holder;
+private long evictionTimestamp;
+private long registrationTimestamp;
+private long serviceUpTimestamp;
+// Make it volatile so that the expiration task would see this quicker
+private volatile long lastUpdateTimestamp;
+private long duration;
+```
+
+可以看出Lease类中存了一些服务相关的时间，比如evictionTimestamp服务下点的时间戳、registrationTimestamp服务注册的时间戳、lastUpdateTimestamp上一次心跳的时间戳等等，然后居于这些时间戳提供了一些判断服务状态的方法和修改这些时间戳的方法。
 
 #### Eureka-Client发起服务续约
 
