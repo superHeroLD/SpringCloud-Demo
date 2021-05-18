@@ -264,6 +264,28 @@ Eureka-Client 向 Eureka-Server 发起注册应用实例需要符合如下条件
    }
 ```
 
+```java
+//discoveryClient.refreshInstanceInfo()源码
+void refreshInstanceInfo() {
+  //从数据源刷新一下Eureka自身的信息，比如IP啊，端口啊
+    applicationInfoManager.refreshDataCenterInfoIfRequired();
+  //从自己的InstanceInfo中，判断一下是不是到了刷新时间了，等等，如果到了，就设置isInstanceInfoDirty 为true
+    applicationInfoManager.refreshLeaseInfoIfRequired();
+
+    InstanceStatus status;
+    try {
+        status = getHealthCheckHandler().getStatus(instanceInfo.getStatus());
+    } catch (Exception e) {
+        logger.warn("Exception from healthcheckHandler.getStatus, setting status to DOWN", e);
+        status = InstanceStatus.DOWN;
+    }
+
+    if (null != status) {
+        applicationInfoManager.setInstanceStatus(status);
+    }
+}
+```
+
 InstanceInfo的status改变发生在调用 `ApplicationInfoManager#setInstanceStatus(...)` 方法，设置应用实例信息的状态，从而通知 `InstanceInfoReplicator#onDemandUpdate()` 方法的调用,在这份方法中最终会调用InstanceInfoReplicator类的InstanceInfoReplicator.this.run();
 
 > Eureka这里有个Pair类，有点意思。可以学习一下这种不固定的多类型参数传递可以自己实现一个类似的类。
